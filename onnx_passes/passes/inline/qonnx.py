@@ -106,6 +106,36 @@ class InlineQONNXQuant(Transformation, RewriteRulePass):
         return op.Mul(op.Sub(q, zeropoint), scale)
 
 
+# Inlines QONNX BipolarQuant custom operator nodes from the CUSTOM_DOMAIN into
+# the graph as a pattern of standard ONNX operators
+@passes.verify.equality
+@passes.register("inline-qonnx")
+class InlineQONNXBipolarQuant(Transformation, RewriteRulePass):
+    def pattern(self, op, x, scale):
+        return op.BipolarQuant(x, scale, _domain=CUSTOM_DOMAIN)
+
+    # Do not apply this to all constant inputs: constant folding version below
+    def check(self, op, x, scale):
+        for value in {x, scale}:
+            if ir.convenience.get_const_tensor(value) is None:
+                return True
+        return False
+
+    def rewrite(self, op, x, scale):
+        # Constants must be ONNX values inside rewrite context
+        _0 = op.Constant(value=ir.tensor(+0.0))
+        _1 = op.Constant(value=ir.tensor(+1.0))
+        m1 = op.Constant(value=ir.tensor(-1.0))
+
+        # Convert to bipolar values with threshold at zero
+        q = op.Where(
+            op.GreaterOrEqual(x, _0), op.CastLike(_1, x), op.CastLike(m1, x)
+        )
+
+        # Apply output scaling
+        return op.Mul(q, scale)
+
+
 # Inlines QONNX Quant custom operator nodes from the CUSTOM_DOMAIN into the
 # graph as a pattern of standard ONNX operators - constant folds the integer
 # part, i.e., up to the rounding function if applicable.
@@ -170,3 +200,31 @@ class FoldConstantQONNXQuant(Transformation, RewriteRulePass):
 
         # Scale and zero point: Integer to Float
         return op.Mul(op.Sub(q, zeropoint), scale)
+
+
+# Inlines QONNX BipolarQuant custom operator nodes from the CUSTOM_DOMAIN into
+# the graph as a pattern of standard ONNX operators - constant folds the full
+# operator when all inputs are constant.
+@passes.verify.equality
+@passes.register("inline-qonnx")
+class FoldConstantQONNXBipolarQuant(Transformation, RewriteRulePass):
+    def pattern(self, op, x, scale):
+        return op.BipolarQuant(x, scale, _domain=CUSTOM_DOMAIN)
+
+    def check(self, op, x, scale):
+        for value in {x, scale}:
+            if ir.convenience.get_const_tensor(value) is None:
+                return False
+        return True
+
+    def rewrite(self, op, x, scale):
+        # Get the constant inputs as numpy arrays
+        x = ir.convenience.get_const_tensor(x).numpy()
+        scale = ir.convenience.get_const_tensor(scale).numpy()
+
+        # Convert to bipolar values with threshold at zero and apply scaling
+        q = np.where(x >= 0, +1, -1)
+        y = q * scale
+
+        # Convert numpy array back to ONNX constant
+        return op.Constant(value=ir.tensor(y))

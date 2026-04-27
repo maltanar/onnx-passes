@@ -109,7 +109,17 @@ class ImportQONNXMultiThreshold(Transformation, RewriteRulePass):
         )
 
 
-# TODO: Import BipolarQuant and Trunc from the QONNX domain...
+# Imports QONNX BipolarQuant custom operator nodes from the QONNX domain into
+# the CUSTOM_DOMAIN to enable ONNX Runtime execution
+class ImportQONNXBipolarQuant(Transformation, RewriteRulePass):
+    def pattern(self, op, x, scale):
+        return op.BipolarQuant(x, scale, _domain=QONNX_DOMAIN)
+
+    def rewrite(self, op, x, scale):
+        return op.BipolarQuant(x, scale, _domain=CUSTOM_DOMAIN)
+
+
+# TODO: Import Trunc from the QONNX domain...
 
 
 # ir.Model, ir.passes.PassResult, ir.from_proto, ir.to_proto, ...
@@ -149,5 +159,6 @@ class ImportQONNX(passes.compose.ComposePass, FunctionalPass):
         _ConvertQONNXMinimumVersion,
         ImportQONNXQuant,
         ImportBrevitasQuant,
-        ImportQONNXMultiThreshold
+        ImportQONNXMultiThreshold,
+        ImportQONNXBipolarQuant,
     ]

@@ -58,3 +58,16 @@ def Quant(x, scale, zeropoint, bitwidth,  # noqa: Operator name is uppercase
 
     # Scale and zero point: Integer to Float
     return op.Mul(op.Sub(q, zeropoint), scale)
+
+
+# QONNX bipolar quantizer custom operator implementation to allow models with
+# custom quantization to be executed via ONNX Runtime
+@register
+def BipolarQuant(x, scale):  # noqa: Operator name is uppercase
+    # Convert to bipolar encoding with threshold at zero
+    q = op.Where(
+        op.GreaterOrEqual(x, 0.0), op.CastLike(1.0, x), op.CastLike(-1.0, x)
+    )
+
+    # Apply output scaling
+    return op.Mul(q, scale)
