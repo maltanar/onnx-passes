@@ -219,10 +219,11 @@ def identity_matrix(_, matrix: ir.Value):
     """Value level checker for the identity matrix in any dimensions."""
 
     # Try to unpack the shapes, raises ValueError if there are not enough
-    # dimensions to unpack (identity matrix needs at least 2 dimensions)
+    # dimensions to unpack (identity matrix needs at least 2 dimensions) or
+    # TypeError if the shape is unknown
     try:
         *_, N, M = matrix.shape
-    except ValueError:
+    except (ValueError, TypeError):
         return False
 
     # The potential identity matrix must be square and match the broadcast NxN
