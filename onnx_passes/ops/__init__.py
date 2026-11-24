@@ -738,3 +738,4 @@ def link_ops(model: ir.Model) -> ir.Model:
 
 import onnx_passes.ops.qonnx
 import onnx_passes.ops.brevitas
+import onnx_passes.ops.sira
