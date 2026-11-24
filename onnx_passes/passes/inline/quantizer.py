@@ -473,6 +473,112 @@ class InlineBrevitasBipolarQuant_v1(InlineQONNXBipolarQuant_v1, Verify):
         return op.BipolarQuant(x, s, _domain=BREVITAS_DOMAIN)
 
 
+def _inline_trunc(op, node: ir.Node):
+    """Inline QONNX Trunc (opset version 1 or 2, told apart by input count)."""
+
+    x, s, z, in_bitwidth, *rest = node.inputs
+
+    # Rounding of the truncated bits: lowercase variants are allowed
+    rounding_mode = node.attributes.get("rounding_mode")
+    rounding_mode = "FLOOR" if rounding_mode is None else rounding_mode.as_string()
+    rounding = {"FLOOR": op.Floor, "CEIL": op.Ceil, "ROUND": op.Round}[
+        rounding_mode.upper()
+    ]
+
+    # Parameters might be of integer type: Match the input type
+    s, z = op.CastLike(s, x), op.CastLike(z, x)
+    _1 = op.CastLike(op.Constant(value_float=1.0), x)
+    _2 = op.CastLike(op.Constant(value_float=2.0), x)
+
+    # Scale to the integer grid of the input and round
+    q = op.Round(op.Add(op.Div(x, s), z))
+
+    # Opset version 1: Drop in_bitwidth - out_bitwidth bits, no clamping, and
+    # rescale by the input scale (as in the specification)
+    if len(rest) == 1:
+        out_bitwidth, = rest
+        q = op.Div(
+            q,
+            op.Pow(
+                _2,
+                op.Sub(
+                    op.CastLike(in_bitwidth, x), op.CastLike(out_bitwidth, x)
+                )
+            )
+        )
+        q = op.ConstantStop(rounding(q), _domain=PASSES_DOMAIN)
+        return op.Mul(op.Sub(q, z), s)
+
+    # Opset version 2: Power-of-two scale ratio, clamping to the output range
+    # and rescaling by the output scale with the zero point on the output grid
+    out_scale, out_bitwidth = rest
+    out_scale = op.CastLike(out_scale, x)
+    bitwidth = op.CastLike(out_bitwidth, x)
+
+    signed = node.attributes.get("signed")
+    signed = 1 if signed is None else signed.as_int()
+    narrow = node.attributes.get("narrow")
+    narrow = 0 if narrow is None else narrow.as_int()
+    signed = op.CastLike(op.Constant(value_int=signed), x)
+    narrow = op.CastLike(op.Constant(value_int=narrow), x)
+
+    trunc_scale = op.Pow(
+        _2, op.Round(op.Div(op.Log(op.Div(out_scale, s)), op.Log(_2)))
+    )
+    q = op.Div(q, trunc_scale)
+
+    minimum = op.Mul(
+        op.Add(op.Neg(op.Pow(_2, op.Sub(bitwidth, signed))), narrow), signed
+    )
+    maximum = op.Sub(
+        op.Sub(
+            op.Pow(_2, op.Sub(bitwidth, signed)),
+            op.Mul(narrow, op.Sub(_1, signed))
+        ),
+        _1
+    )
+
+    q = op.Min(op.Max(q, minimum), maximum)
+    q = op.ConstantStop(rounding(q), _domain=PASSES_DOMAIN)
+    return op.Mul(op.Sub(q, op.Div(z, trunc_scale)), out_scale)
+
+
+class InlineQONNXTrunc_v1(RewriteRule, Verify):
+    """Inline QONNX custom truncation (opset version 1 or 2) into the graph."""
+
+    @staticmethod
+    def pattern(op, x):
+        return op.Trunc(
+            x, _allow_other_inputs=True, _outputs=["out"], _domain=QONNX_DOMAIN
+        )
+
+    @staticmethod
+    def check(context, x, out):
+        node = out.producer()
+        # Opset version 1 has 5 inputs, version 2 has 6 inputs
+        if len(node.inputs) not in {5, 6} or any(i is None for i in node.inputs):
+            return False
+        rounding_mode = node.attributes.get("rounding_mode")
+        if rounding_mode is not None:
+            return rounding_mode.as_string().upper() in {"FLOOR", "CEIL", "ROUND"}
+        return True
+
+    @staticmethod
+    def rewrite(op, x, out):
+        return _inline_trunc(op, out.producer())
+
+
+class InlineBrevitasTrunc_v1(InlineQONNXTrunc_v1, Verify):
+    """Inline QONNX custom truncation (Brevitas domain) into the graph."""
+
+    @staticmethod
+    def pattern(op, x):
+        return op.Trunc(
+            x, _allow_other_inputs=True, _outputs=["out"],
+            _domain=BREVITAS_DOMAIN
+        )
+
+
 class InlineQuantizer_v1(Sequential):
     """Apply quantizer inlining transformations."""
 
@@ -482,4 +588,6 @@ class InlineQuantizer_v1(Sequential):
         InlineBrevitasQuant_v1,
         InlineQONNXBipolarQuant_v1,
         InlineBrevitasBipolarQuant_v1,
+        InlineQONNXTrunc_v1,
+        InlineBrevitasTrunc_v1,
     ]

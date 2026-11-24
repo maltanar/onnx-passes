@@ -274,3 +274,156 @@ class BipolarQuant_v1(OnnxOperator, domain=DOMAIN):
             return op.Mul(q, scale)
 
         return bipolar_quant
+
+
+class Trunc_v1(OnnxOperator, domain=DOMAIN):
+    """QONNX truncation custom operator (opset version 1).
+
+    Rounds the input to the integer grid of the input scale and zero point,
+    then drops the in_bitwidth - out_bitwidth least significant bits. Note that
+    the output is rescaled by the *input* scale, as in the specification.
+
+    See https://github.com/fastmachinelearning/qonnx for details.
+    """
+
+    @staticmethod
+    def script(op: Opset):
+        """Generate an ONNX Script function implementing Trunc."""
+
+        def trunc(
+                x,
+                scale,
+                zeropt,
+                in_bitwidth,
+                out_bitwidth,
+                rounding_mode: str = "FLOOR"
+        ):
+            # Parameters might be of integer type: Match the input type
+            scale = op.CastLike(scale, x)
+            zeropt = op.CastLike(zeropt, x)
+
+            # Scale to the integer grid of the input and round
+            q = op.Round(op.Add(op.Div(x, scale), zeropt))
+
+            # Truncation scale: Drop the least significant bits
+            q = op.Div(
+                q,
+                op.Pow(
+                    op.CastLike(op.Constant(value_float=2.0), x),
+                    op.Sub(
+                        op.CastLike(in_bitwidth, x),
+                        op.CastLike(out_bitwidth, x)
+                    )
+                )
+            )
+
+            # Rounding of the truncated bits according to the rounding mode,
+            # lowercase variants are allowed by the specification
+            if rounding_mode == op.Constant(value_string="FLOOR"):
+                y = op.Floor(q)
+            elif rounding_mode == op.Constant(value_string="floor"):
+                y = op.Floor(q)
+            elif rounding_mode == op.Constant(value_string="ROUND"):
+                y = op.Round(q)
+            elif rounding_mode == op.Constant(value_string="round"):
+                y = op.Round(q)
+            # Note: The ONNX reference evaluator refuses comparing strings of
+            # different length, thus test the 4-character modes last
+            elif rounding_mode == op.Constant(value_string="CEIL"):
+                y = op.Ceil(q)
+            elif rounding_mode == op.Constant(value_string="ceil"):
+                y = op.Ceil(q)
+            # Else branch cannot be omitted, and it is not possible to raise
+            # exceptions or assertions - fallback to NaN...
+            else:
+                y = op.CastLike(op.Constant(value_float=np.nan), q)
+
+            # Integer to float: Note the input scale as in the specification
+            return op.Mul(op.Sub(y, zeropt), scale)
+
+        return trunc
+
+
+class Trunc_v2(OnnxOperator, domain=DOMAIN):
+    """QONNX truncation custom operator (opset version 2).
+
+    Rounds the input to the integer grid of the input scale and zero point,
+    divides by the power-of-two ratio of output and input scale, clamps to the
+    output bitwidth and rounds, then rescales by the output scale.
+
+    See https://github.com/fastmachinelearning/qonnx for details.
+    """
+
+    @staticmethod
+    def script(op: Opset):
+        """Generate an ONNX Script function implementing Trunc."""
+
+        def trunc(
+                x,
+                scale,
+                zeropt,
+                in_bitwidth,
+                out_scale,
+                out_bitwidth,
+                rounding_mode: str = "FLOOR",
+                signed: int = 1,
+                narrow: int = 0
+        ):
+            # Parameters might be of integer type: Match the input type
+            scale = op.CastLike(scale, x)
+            zeropt = op.CastLike(zeropt, x)
+            out_scale = op.CastLike(out_scale, x)
+            bitwidth = op.CastLike(out_bitwidth, x)
+            signed = op.CastLike(op.Constant(value_int=signed), x)
+            narrow = op.CastLike(op.Constant(value_int=narrow), x)
+            _1 = op.CastLike(op.Constant(value_float=1.0), x)
+            _2 = op.CastLike(op.Constant(value_float=2.0), x)
+
+            # Scale to the integer grid of the input and round
+            q = op.Round(op.Add(op.Div(x, scale), zeropt))
+
+            # Truncation scale: Power-of-two ratio of output and input scales
+            trunc_scale = op.Pow(
+                _2, op.Round(op.Div(op.Log(op.Div(out_scale, scale)), op.Log(_2)))
+            )
+            q = op.Div(q, trunc_scale)
+
+            # Clamp to the output integer range:
+            #   [(-2 ** (bitwidth - signed) + narrow) * signed,
+            #    2 ** (bitwidth - signed) - 1 - narrow * (1 - signed)]
+            minimum = op.Mul(
+                op.Add(op.Neg(op.Pow(_2, op.Sub(bitwidth, signed))), narrow),
+                signed
+            )
+            maximum = op.Sub(
+                op.Sub(
+                    op.Pow(_2, op.Sub(bitwidth, signed)),
+                    op.Mul(narrow, op.Sub(_1, signed))
+                ),
+                _1
+            )
+            q = op.Min(op.Max(q, minimum), maximum)
+
+            # Rounding of the truncated bits according to the rounding mode,
+            # lowercase variants are allowed by the specification
+            if rounding_mode == op.Constant(value_string="FLOOR"):
+                y = op.Floor(q)
+            elif rounding_mode == op.Constant(value_string="floor"):
+                y = op.Floor(q)
+            elif rounding_mode == op.Constant(value_string="ROUND"):
+                y = op.Round(q)
+            elif rounding_mode == op.Constant(value_string="round"):
+                y = op.Round(q)
+            # Note: The ONNX reference evaluator refuses comparing strings of
+            # different length, thus test the 4-character modes last
+            elif rounding_mode == op.Constant(value_string="CEIL"):
+                y = op.Ceil(q)
+            elif rounding_mode == op.Constant(value_string="ceil"):
+                y = op.Ceil(q)
+            else:
+                y = op.CastLike(op.Constant(value_float=np.nan), q)
+
+            # Integer to float with the zero point rescaled to the output grid
+            return op.Mul(op.Sub(y, op.Div(zeropt, trunc_scale)), out_scale)
+
+        return trunc
