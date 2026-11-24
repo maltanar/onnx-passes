@@ -97,6 +97,9 @@ class Quant_v1(OnnxOperator, domain=DOMAIN):
 
             # Divide input by scale and shift by zeropoint: Float to integer
             # quantization, still with fractional part and can be out of range.
+            # The zero point might be of integer type (non-standard, but
+            # accepted by QONNX), cast to match the input
+            zeropoint = op.CastLike(zeropoint, x)
             q = op.Add(op.Div(x, scale), zeropoint)
 
             # Clipping to the integer range, used in all rounding mode branches

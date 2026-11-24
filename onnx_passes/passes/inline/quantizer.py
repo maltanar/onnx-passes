@@ -98,6 +98,9 @@ class InlineQuant_v1(RewriteRule, Verify):
 
         # Divide input by scale and shift by zeropoint: Float to integer
         # quantization, still with fractional part and can be out of range.
+        # The zero point might be of integer type (non-standard, but accepted
+        # by QONNX), cast to match the input for the float arithmetic
+        z = op.CastLike(z, x)
         q = op.Add(op.Div(x, s), z)
 
         # Clipping and rounding according to the selected rounding mode or
@@ -245,6 +248,9 @@ class InlineQONNXQuant_v1(RewriteRule, Verify):
 
         # Divide input by scale and shift by zeropoint: Float to integer
         # quantization, still with fractional part and can be out of range.
+        # The zero point might be of integer type (non-standard, but accepted
+        # by QONNX), cast to match the input for the float arithmetic
+        z = op.CastLike(z, x)
         q = op.Add(op.Div(x, s), z)
 
         # Clipping to the integer range, used in all rounding mode branches
