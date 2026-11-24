@@ -47,6 +47,7 @@ GitHub = "https://github.com/iksnagreb/onnx-passes"
 # Script entrypoints which should be registered when installing the project
 [project.scripts]
 onnx-passes = "onnx_passes.cli.main:main"
+onnx-passes-sira = "onnx_passes.cli.sira:main"
 
 # Build-system configuration: Build the proejct using poetry with dynamic
 # versioning where the version is derived from the latest git tag

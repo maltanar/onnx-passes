@@ -8,6 +8,7 @@ import pytest
 from onnx.reference import ReferenceEvaluator
 from onnx.reference.op_run import OpRun
 
+from onnx_passes.cli.sira import main as sira_cli_main
 from onnx_passes.ops.qonnx import DOMAIN as QONNX_DOMAIN
 from onnx_passes.passes.sira import (
     RangeAnalysis_v1,
@@ -15,6 +16,7 @@ from onnx_passes.passes.sira import (
     compute_accumulator_bitwidth,
     detect_stuck_channels,
     evaluate_ranges,
+    summarize_ranges,
 )
 
 
@@ -750,6 +752,55 @@ def test_accumulator_sizing_and_stuck_channels():
     assert "mm" not in stuck
     assert stuck["y"]["stuck_channels"] == [1]
     assert stuck["y"]["total_channels"] == 2
+
+
+def test_summarize_ranges_and_cli(tmp_path):
+    x = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    w_raw = _const("w_raw", np.array([[1.0, 1.0], [1.0, 1.0]], dtype=np.float32))
+    ws = _const("ws", np.array(1.0, dtype=np.float32))
+    wz = _const("wz", np.array(0.0, dtype=np.float32))
+    wbw = _const("wbw", np.array(4.0, dtype=np.float32))
+    wq = ir.Value(name="wq", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([2, 2]))
+    b = _const("b", np.array([0.0, -20.0], dtype=np.float32))
+    mm = ir.Value(name="mm", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    add_out = ir.Value(name="add_out", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    y = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    nodes = [
+        ir.Node(QONNX_DOMAIN, "Quant", [w_raw, ws, wz, wbw], attributes={"signed": ir.Attr("signed", ir.AttributeType.INT, 1), "narrow": ir.Attr("narrow", ir.AttributeType.INT, 0)}, outputs=[wq]),
+        ir.Node("", "MatMul", [x, wq], outputs=[mm]),
+        ir.Node("", "Add", [mm, b], outputs=[add_out]),
+        ir.Node("", "Relu", [add_out], outputs=[y]),
+    ]
+    model = _make_model([x], [y], nodes, initializers=[w_raw, ws, wz, wbw, b], extra_opsets={QONNX_DOMAIN: 1})
+    model_path = tmp_path / "model.onnx"
+    ir.save(model, model_path)
+
+    # Non-existent channel_axis=3 on 2D tensors must not error out
+    ranges = _run_sira(model, {"x": (np.full((1, 2), -2.0, np.float32), np.full((1, 2), 2.0, np.float32))},
+                       input_scales={"x": (np.array(0.5, np.float32), np.array(0.0, np.float32))})
+    assert analyze_accumulators(model, ranges, channel_axis=3)[0]["per_channel_bitwidths"] is None
+    assert detect_stuck_channels(model, ranges, channel_axis=3) == {}
+    ch_fallback = summarize_ranges(ranges, granularity="channel", channel_axis=3)
+    assert "channel_real_min" not in ch_fallback["y"]
+
+    # CLI end-to-end with channel granularity + Markdown + JSON
+    md_path = tmp_path / "report.md"
+    json_path = tmp_path / "report.json"
+    rc = sira_cli_main([
+        str(model_path),
+        "--min", "-3", "--max", "3",
+        "--input-scale", "0.5", "--input-bias", "0.0",
+        "--granularity", "channel",
+        "--channel-axis", "1",
+        "--report", str(md_path),
+        "--json", str(json_path),
+    ])
+    assert rc == 0
+    assert md_path.exists() and "Accumulator Sizing" in md_path.read_text()
+    data = json.loads(json_path.read_text())
+    assert data["accumulators"][0]["bitwidth"] == 4
+    assert data["stuck_channels"]["y"]["stuck_channels"] == [1]
+    assert data["ranges"]["y"]["channel_real_max"] == [3.0, 0.0]
 
 
 

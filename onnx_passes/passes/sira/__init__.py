@@ -763,9 +763,21 @@ def _dynamic_tensor_names(orig_model: ir.Model) -> set[str]:
     return dyn
 
 
+def _resolve_channel_axis(shape: tuple[int, ...], channel_axis: int) -> int | None:
+    """Resolve channel_axis for shape, returning None if that axis does not exist."""
+    ndim = len(shape)
+    if ndim == 0:
+        return None
+    if ndim == 1:
+        return 0 if channel_axis in (0, -1) else None
+    ax = channel_axis if channel_axis >= 0 else ndim + channel_axis
+    return ax if 0 <= ax < ndim else None
+
+
 def analyze_accumulators(
     orig_model: ir.Model,
     ranges: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    channel_axis: int = 1,
 ) -> list[dict[str, Any]]:
     """Compute per-layer (and per-channel when available) accumulator bitwidths for Conv/MatMul/Gemm."""
     dyn_tensors = _dynamic_tensor_names(orig_model)
@@ -782,13 +794,14 @@ def analyze_accumulators(
         per_channel_bitwidths: list[int] | None = None
         if is_si:
             bitwidth = compute_accumulator_bitwidth(vmin, vmax)
-            if vmin.ndim >= 2 and vmin.shape[1] > 1:
-                ch_axes = tuple(i for i in range(vmin.ndim) if i != 1)
-                ch_min = np.min(vmin, axis=ch_axes)
-                ch_max = np.max(vmax, axis=ch_axes)
+            ax = _resolve_channel_axis(vmin.shape, channel_axis)
+            if ax is not None and vmin.shape[ax] > 1:
+                ch_axes = tuple(i for i in range(vmin.ndim) if i != ax)
+                ch_min = np.min(vmin, axis=ch_axes) if ch_axes else vmin
+                ch_max = np.max(vmax, axis=ch_axes) if ch_axes else vmax
                 per_channel_bitwidths = [
                     compute_accumulator_bitwidth(ch_min[c : c + 1], ch_max[c : c + 1])
-                    for c in range(vmin.shape[1])
+                    for c in range(vmin.shape[ax])
                 ]
         results.append({
             "node": node.name or f"{node.op_type}_{node_idx}",
@@ -805,6 +818,7 @@ def detect_stuck_channels(
     orig_model: ir.Model,
     ranges: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
     atol: float = 1e-6,
+    channel_axis: int = 1,
 ) -> dict[str, dict[str, Any]]:
     """Detect dynamic activation channels whose SIRA range collapses to a single constant."""
     dyn_inputs = {i.name for i in orig_model.graph.inputs if i.const_value is None}
@@ -815,16 +829,14 @@ def detect_stuck_channels(
             continue
         rmin, rmax = _real_range_from_tuple(vmin, vmax, vscale, vbias)
         diff = rmax - rmin
-        if diff.ndim >= 2:
-            ch_axes = tuple(i for i in range(diff.ndim) if i != 1)
+        ax = _resolve_channel_axis(diff.shape, channel_axis)
+        if ax is not None:
+            ch_axes = tuple(i for i in range(diff.ndim) if i != ax)
             ch_max_diff = np.max(diff, axis=ch_axes) if ch_axes else diff
             ch_indices = np.where(ch_max_diff <= atol)[0].tolist()
-            total_ch = int(diff.shape[1])
-        elif diff.ndim == 1:
-            ch_indices = np.where(diff <= atol)[0].tolist()
-            total_ch = int(diff.shape[0])
+            total_ch = int(diff.shape[ax])
         else:
-            ch_indices = [0] if float(diff) <= atol else []
+            ch_indices = [0] if float(np.max(diff)) <= atol else []
             total_ch = 1
         if ch_indices:
             stuck[tname] = {
@@ -832,6 +844,59 @@ def detect_stuck_channels(
                 "total_channels": total_ch,
             }
     return stuck
+
+
+def summarize_ranges(
+    ranges: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    granularity: str = "tensor",
+    channel_axis: int = 1,
+) -> dict[str, dict[str, Any]]:
+    """Summarize SIRA ranges at 'tensor', 'channel', or 'element' granularity."""
+    if granularity not in ("tensor", "channel", "element"):
+        raise ValueError(f"Unsupported granularity {granularity!r}; expected 'tensor', 'channel', or 'element'")
+
+    summary: dict[str, dict[str, Any]] = {}
+    for tname, (vmin, vmax, vscale, vbias) in ranges.items():
+        is_si = not (np.isnan(vscale).any() or np.isnan(vbias).any())
+        rmin, rmax = _real_range_from_tuple(vmin, vmax, vscale, vbias)
+        entry: dict[str, Any] = {
+            "shape": list(rmin.shape),
+            "is_scaled_int": is_si,
+            "real_min": float(np.min(rmin)),
+            "real_max": float(np.max(rmax)),
+        }
+        if is_si:
+            entry["int_min"] = float(np.min(vmin))
+            entry["int_max"] = float(np.max(vmax))
+
+        if granularity == "channel":
+            ax = _resolve_channel_axis(rmin.shape, channel_axis)
+            if ax is not None and rmin.shape[ax] > 1:
+                ch_axes = tuple(i for i in range(rmin.ndim) if i != ax)
+                c_rmin = np.min(rmin, axis=ch_axes) if ch_axes else rmin
+                c_rmax = np.max(rmax, axis=ch_axes) if ch_axes else rmax
+                entry["channel_axis"] = ax
+                entry["channel_real_min"] = [float(x) for x in c_rmin]
+                entry["channel_real_max"] = [float(x) for x in c_rmax]
+                if is_si:
+                    v_ax = _resolve_channel_axis(vmin.shape, channel_axis)
+                    if v_ax is not None and vmin.shape[v_ax] == rmin.shape[ax]:
+                        v_ch_axes = tuple(i for i in range(vmin.ndim) if i != v_ax)
+                        c_vmin = np.min(vmin, axis=v_ch_axes) if v_ch_axes else vmin
+                        c_vmax = np.max(vmax, axis=v_ch_axes) if v_ch_axes else vmax
+                        entry["channel_int_min"] = [float(x) for x in c_vmin]
+                        entry["channel_int_max"] = [float(x) for x in c_vmax]
+        elif granularity == "element":
+            entry["real_min_elements"] = rmin.tolist()
+            entry["real_max_elements"] = rmax.tolist()
+            if is_si:
+                entry["int_min_elements"] = vmin.tolist()
+                entry["int_max_elements"] = vmax.tolist()
+                entry["scale"] = vscale.tolist()
+                entry["bias"] = vbias.tolist()
+
+        summary[tname] = entry
+    return summary
 
 
 def evaluate_ranges(
