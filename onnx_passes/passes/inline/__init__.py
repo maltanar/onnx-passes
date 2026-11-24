@@ -6,8 +6,10 @@ import onnx_ir as ir
 # Common passes already implemented in ONNX IR
 import onnx_ir.passes.common
 
+# Functions with dedicated inlining rules (inline.quantizer) or which are kept
+# as custom operators
 _BLACKLIST: set[str] = {
-    "Quant", "MultiThreshold", "Im2Col", "LayoutConverter"
+    "Quant", "Trunc", "MultiThreshold", "Im2Col", "LayoutConverter"
 }
 
 
