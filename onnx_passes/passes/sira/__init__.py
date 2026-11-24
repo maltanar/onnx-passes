@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 import numpy as np
@@ -128,6 +129,7 @@ def _tag_tuple(
 ):
     for val, role in zip(tup, ("min", "max", "scale", "bias")):
         val.meta["sira_origin"] = (orig_name, role)
+        val.metadata_props["sira_origin"] = f"{orig_name}:{role}"
 
 
 class RangeAnalysis_v1(Transformation):
@@ -147,11 +149,6 @@ class RangeAnalysis_v1(Transformation):
         graph.opset_imports[""] = max(orig_opset, 18)
         graph.opset_imports[SIRA_DOMAIN] = 1
 
-        # Shared scalar NaN constant for non-scaled-integer scale/bias
-        nan_const = _make_const(
-            graph, np.array(np.nan, dtype=np.float32), "__sira_nan"
-        )
-
         # Map original ir.Value -> (v_min, v_max, v_scale, v_bias)
         range_map: dict[
             ir.Value, tuple[ir.Value, ir.Value, ir.Value, ir.Value]
@@ -159,8 +156,16 @@ class RangeAnalysis_v1(Transformation):
         # Track statically known integer shape tensors (Shape/Gather/Unsqueeze/Concat)
         const_shapes: dict[ir.Value, np.ndarray] = {}
 
+        # Snapshot original initializers before adding SIRA constants
+        orig_initializers = list(graph.initializers.values())
+
+        # Shared scalar NaN constant for non-scaled-integer scale/bias
+        nan_const = _make_const(
+            graph, np.array(np.nan, dtype=np.float32), "__sira_nan"
+        )
+
         # Map original initializers
-        for init_val in list(graph.initializers.values()):
+        for init_val in orig_initializers:
             range_map[init_val] = (init_val, init_val, nan_const, nan_const)
 
         # Replace graph inputs: initializers listed in inputs become constants;
@@ -205,8 +210,10 @@ class RangeAnalysis_v1(Transformation):
         graph.inputs.extend(new_inputs)
 
         new_nodes: list[ir.Node] = []
+        node_origins: list[tuple[str, ir.Node]] = []
         old_nodes = list(graph)
         counter = 0
+        cur_orig_node_name: str | None = None
 
         def next_name(prefix: str) -> str:
             nonlocal counter
@@ -220,6 +227,7 @@ class RangeAnalysis_v1(Transformation):
             tag_name: str | None = None,
             out_shape: ir.Shape | None = None,
             out_type: Any = None,
+            orig_node_name: str | None = None,
         ) -> tuple[ir.Value, ir.Value, ir.Value, ir.Value]:
             base = tag_name or next_name(op_type)
             outs = tuple(
@@ -244,6 +252,11 @@ class RangeAnalysis_v1(Transformation):
                 attributes=attributes or {},
                 name=next_name(op_type),
             )
+            origin = orig_node_name if orig_node_name is not None else cur_orig_node_name
+            if origin is not None:
+                node.meta["sira_origin"] = origin
+                node.metadata_props["sira_origin"] = origin
+                node_origins.append((origin, node))
             new_nodes.append(node)
             return outs  # type: ignore[return-value]
 
@@ -251,8 +264,9 @@ class RangeAnalysis_v1(Transformation):
             c = _make_const(graph, arr, next_name(prefix))
             return (c, c, nan_const, nan_const)
 
-        for node in old_nodes:
+        for node_idx, node in enumerate(old_nodes):
             op_type = node.op_type
+            cur_orig_node_name = node.name or f"{op_type}_{node_idx}"
 
             if op_type == "Constant":
                 new_nodes.append(node)
@@ -689,13 +703,30 @@ class RangeAnalysis_v1(Transformation):
         graph.outputs.clear()
         graph.outputs.extend(new_outputs)
 
-        # Record all range tuples in model metadata so intermediate names can be
-        # resolved even after canonical renaming
+        # Record all range tuples and node origins in model metadata so names
+        # can be resolved even after canonical renaming or save/reload
         model.meta["sira_range_map"] = {
             orig_val.name: tup for orig_val, tup in range_map.items() if orig_val.name
         }
+        model.meta["sira_node_origins"] = node_origins
 
         return ir.passes.PassResult(model, True)
+
+    def cleanup(self, result: ir.passes.PassResult):
+        result = super().cleanup(result)
+        model = result.model
+        if "sira_range_map" in model.meta:
+            model.metadata_props["sira_range_map"] = json.dumps({
+                orig_name: [v.name for v in tup]
+                for orig_name, tup in model.meta["sira_range_map"].items()
+            })
+        if "sira_node_origins" in model.meta:
+            node_map: dict[str, list[str]] = {}
+            for orig_name, sira_node in model.meta["sira_node_origins"]:
+                if sira_node.name:
+                    node_map.setdefault(orig_name, []).append(sira_node.name)
+            model.metadata_props["sira_node_map"] = json.dumps(node_map)
+        return result
 
 
 def _real_range_from_tuple(
@@ -759,6 +790,14 @@ def evaluate_ranges(
         rank = len(inp_val.shape) if inp_val.shape is not None else 0
         return np.full((1,) * rank, np.nan, dtype=np.float32)
 
+    def _val_origin(val: ir.Value) -> tuple[str, str] | None:
+        if (origin := val.meta.get("sira_origin")) is not None:
+            return origin
+        if (prop := val.metadata_props.get("sira_origin")) is not None:
+            orig_name, role = prop.rsplit(":", 1)
+            return (orig_name, role)
+        return None
+
     if isinstance(input_ranges, list):
         # Positional: every 4 inputs correspond to 1 original dynamic input
         for idx, (r_min, r_max) in enumerate(input_ranges):
@@ -774,7 +813,8 @@ def evaluate_ranges(
     else:
         for i in range(0, len(model.graph.inputs), 4):
             inp_min, inp_max, inp_s, inp_b = model.graph.inputs[i : i + 4]
-            orig_name = inp_min.meta.get("sira_origin", (inp_min.name.removesuffix("__sira_min"), "min"))[0]
+            origin = _val_origin(inp_min)
+            orig_name = origin[0] if origin is not None else inp_min.name.removesuffix("__sira_min")
             r_min, r_max = input_ranges[orig_name]
             dtype = inp_min.dtype.numpy() if inp_min.dtype else np.float32
             feed[inp_min.name] = np.asarray(r_min, dtype=dtype)
@@ -794,13 +834,24 @@ def evaluate_ranges(
                 feed[inp_s.name] = _nan_for(inp_s)
                 feed[inp_b.name] = _nan_for(inp_b)
 
-    # Collect tagged values in graph
+    # Collect tagged values in graph (in-memory meta, ValueInfo metadata_props, or model metadata_props)
     tagged: dict[str, list[ir.Value | None]] = {}
-    for val in list(model.graph.inputs) + [o for n in model.graph for o in n.outputs]:
-        if (origin := val.meta.get("sira_origin")) is not None:
+    all_vals = list(model.graph.inputs) + [o for n in model.graph for o in n.outputs]
+    val_by_name = {v.name: v for v in all_vals if v.name}
+    val_by_name.update({k: v for k, v in model.graph.initializers.items()})
+
+    for val in all_vals:
+        if (origin := _val_origin(val)) is not None:
             orig_name, role = origin
             slot = {"min": 0, "max": 1, "scale": 2, "bias": 3}[role]
             tagged.setdefault(orig_name, [None, None, None, None])[slot] = val
+
+    if (range_map_json := model.metadata_props.get("sira_range_map")) is not None:
+        for orig_name, names in json.loads(range_map_json).items():
+            if orig_name not in tagged:
+                vals = [val_by_name.get(n) for n in names]
+                if all(v is not None for v in vals):
+                    tagged[orig_name] = vals
 
     if backend == "onnxruntime":
         if intermediates:

@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -670,6 +671,44 @@ def test_shape_layout_and_backend_parity():
         for idx in range(4):
             np.testing.assert_allclose(r_ort[k][idx], r_ref[k][idx], atol=1e-6)
     _assert_sound(model, r_ort, {"x": (lo, hi)}, input_scales=sc, n_samples=5)
+
+
+def test_name_preservation_roundtrip(tmp_path: Path):
+    """Verify original tensor and node names survive canonical renaming and .onnx save/reload."""
+    x = ir.Value(name="orig_in", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    w = _const("orig_w", np.array([[1.0, -1.0], [0.5, 0.5]], dtype=np.float32))
+    b = _const("orig_b", np.array([0.2, -0.3], dtype=np.float32))
+    mm = ir.Value(name="orig_mm")
+    y = ir.Value(name="orig_out", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    nodes = [
+        ir.Node("", "Gemm", [x, w, b], outputs=[mm], name="orig_gemm_node"),
+        ir.Node("", "Relu", [mm], outputs=[y], name="orig_relu_node"),
+    ]
+    model = _make_model([x], [y], nodes, initializers=[w, b])
+
+    rm = RangeAnalysis_v1()(model).model
+    onnx_path = tmp_path / "range_model.onnx"
+    ir.save(rm, onnx_path)
+    reloaded = ir.load(onnx_path)
+
+    # Check node provenance on handler nodes and model-level sira_node_map
+    node_origins = {
+        n.name: n.metadata_props.get("sira_origin")
+        for n in reloaded.graph
+        if n.domain == "onnx_passes.ops.sira"
+    }
+    assert set(node_origins.values()) == {"orig_gemm_node", "orig_relu_node"}
+    node_map = json.loads(reloaded.metadata_props["sira_node_map"])
+    assert "orig_gemm_node" in node_map and len(node_map["orig_gemm_node"]) == 2  # MatMul + Add
+    assert "orig_relu_node" in node_map and len(node_map["orig_relu_node"]) == 1
+
+    # Check evaluate_ranges works on reloaded model using original tensor names
+    lo = np.array([[-1.0, -2.0]], dtype=np.float32)
+    hi = np.array([[2.0, 1.0]], dtype=np.float32)
+    ranges = evaluate_ranges(reloaded, {"orig_in": (lo, hi)}, backend="onnxruntime", intermediates=True)
+    for tname in ("orig_in", "orig_mm", "orig_out"):
+        assert tname in ranges
+        assert np.all(ranges[tname][0] <= ranges[tname][1] + 1e-5)
 
 
 # ---------------------------------------------------------------------------
