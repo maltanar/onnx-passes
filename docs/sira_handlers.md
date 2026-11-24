@@ -232,7 +232,12 @@ All remaining non-linear operators below convert inputs to real-valued $[x_{\tex
 - **`Gather` (`SiraGather_v1`)**: Assumes constant indices `idx_min`; gathers `x_min` and `x_max` along `axis`, outputting `NaN` scale/bias.
 - **`Unsqueeze` (`SiraUnsqueeze_v1`)**: Unsqueezes `x_min` and `x_max` along `axes`, outputting `NaN` scale/bias.
 - **`Concat` (`SiraConcat2_v1`, pairwise chained)**: Concatenates `min` and `max` along `axis`, outputting `NaN` scale/bias.
-- **`Cast` (`SiraCast_v1`)**: Casts `x_min` and `x_max` to target dtype `to`, outputting `NaN` scale/bias.
+- **`Cast` (`SiraCast_v1`)**: Passes `(x_min, x_max, x_scale, x_bias)` through unchanged when `to` is floating-point (`FLOAT`, `FLOAT16`, `DOUBLE`, `BFLOAT16`); otherwise casts real bounds to `to` and back to `FLOAT` with `scale = 1.0, bias = 0.0`.
+- **`CastLike` (`SiraCastLike_v1`)**: Passes `(x_min, x_max, x_scale, x_bias)` through unchanged, ignoring the target-type input.
+- **Comparisons (`GreaterOrEqual`, `Greater`, `LessOrEqual`, `Less`, `Equal`)**: Output integer `{0, 1}` bounds `(lo, hi, 1.0, 0.0)`; `lo = hi = 1` when the input real intervals decide true, `lo = hi = 0` when decided false, and `(0, 1)` otherwise.
+- **`Where` (`SiraWhere_v1`)**:
+  - If `c` is decided (`c_rmin > 0` everywhere or `c_rmax <= 0` everywhere), passes the chosen branch through (broadcast to the output shape).
+  - Otherwise outputs the union `[min(a_rmin, b_rmin), max(a_rmax, b_rmax)]`; when `a` and `b` are integer constants (e.g., bipolar `±1`), outputs `(min, max, 1.0, 0.0)`, else `NaN` scale/bias.
 
 ---
 
