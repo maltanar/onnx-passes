@@ -14,6 +14,7 @@ from onnx_passes.passes.reorder import arithmetic
 from onnx_passes.passes.reorder import reduce
 from onnx_passes.passes.reorder import where
 from onnx_passes.passes.reorder import im2col
+from onnx_passes.passes.reorder import linear
 
 from onnx_passes.passes import inline
 from onnx_passes.passes import normalize
@@ -43,6 +44,7 @@ class Reorder_v1(Sequential):
         reduce,
         where,
         im2col,
+        linear,
     ]
 
     exhaustive = True
