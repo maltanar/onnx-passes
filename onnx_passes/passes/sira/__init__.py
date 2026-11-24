@@ -283,20 +283,21 @@ class RangeAnalysis_v1(Transformation):
                 x_val = node.inputs[0]
                 w_val = node.inputs[1]
                 # Determine spatial rank from weights or kernel_shape
+                w_shape = w_val.shape or range_map[w_val][0].shape
                 if (ks_attr := node.attributes.get("kernel_shape")) is not None:
                     ks = list(ks_attr.as_ints())
-                elif w_val.shape is not None and len(w_val.shape) > 2:
-                    ks = [int(d) for d in w_val.shape[2:]]
+                elif w_shape is not None and len(w_shape) > 2:
+                    ks = [int(d) for d in w_shape[2:]]
                 else:
                     ks = [1, 1]
                 srank = len(ks)
                 group = _attr_int(node, "group", 1)
                 is_dw = (
                     group > 1
-                    and w_val.shape is not None
-                    and len(w_val.shape) >= 2
-                    and w_val.shape[0] == group
-                    and w_val.shape[1] == 1
+                    and w_shape is not None
+                    and len(w_shape) >= 2
+                    and w_shape[0] == group
+                    and w_shape[1] == 1
                 )
                 conv_op = "DepthwiseConv" if is_dw else "Conv"
                 attrs = {

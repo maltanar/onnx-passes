@@ -1110,6 +1110,8 @@ class SiraBatchNormalization_v1(OnnxOperator, domain=DOMAIN, op_type="BatchNorma
             inv_std = op.Div(s_val, op.Sqrt(op.Add(v_val, eps_t)))
             bn_s = op.Reshape(inv_std, param_shape)
             bn_b = op.Reshape(op.Sub(b_val, op.Mul(m_val, inv_std)), param_shape)
+            bn_m = op.Reshape(m_val, param_shape)
+            bn_bias_only = op.Reshape(b_val, param_shape)
 
             nan_s = op.Constant(value_float=float("nan"))
             nan_b = op.Constant(value_float=float("nan"))
@@ -1117,11 +1119,26 @@ class SiraBatchNormalization_v1(OnnxOperator, domain=DOMAIN, op_type="BatchNorma
                 x_min, x_max, x_scale, x_bias,
                 bn_s, bn_s, nan_s, nan_b,
             )
-            y_min, y_max, y_scale, y_bias = sira.Add(
+            si_min, si_max, si_scale, si_bias = sira.Add(
                 m_out_min, m_out_max, m_out_scale, m_out_bias,
                 bn_b, bn_b, nan_s, nan_b,
             )
-            return y_min, y_max, y_scale, y_bias
+
+            # For non-scaled-integer inputs, evaluate (x - mean) * inv_std + b directly
+            # to avoid catastrophic cancellation when var is near 0.
+            x_si = sira.IsScaledInt(x_scale, x_bias)
+            x_rmin, x_rmax = sira.ToRealRange(x_min, x_max, x_scale, x_bias)
+            r1 = op.Add(op.Mul(op.Sub(x_rmin, bn_m), bn_s), bn_bias_only)
+            r2 = op.Add(op.Mul(op.Sub(x_rmax, bn_m), bn_s), bn_bias_only)
+            r_min = op.Min(r1, r2)
+            r_max = op.Max(r1, r2)
+
+            return (
+                op.Where(x_si, si_min, r_min),
+                op.Where(x_si, si_max, r_max),
+                op.Where(x_si, si_scale, nan_s),
+                op.Where(x_si, si_bias, nan_b),
+            )
 
         return sira_batchnorm
 
