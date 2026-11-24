@@ -752,6 +752,88 @@ def compute_accumulator_bitwidth(z_min: np.ndarray, z_max: np.ndarray) -> int:
     return int(np.ceil(np.log2(max_abs))) + 1
 
 
+def _dynamic_tensor_names(orig_model: ir.Model) -> set[str]:
+    """Return names of tensors reachable from dynamic (non-constant) graph inputs."""
+    dyn = {i.name for i in orig_model.graph.inputs if i.const_value is None}
+    for node in orig_model.graph:
+        if any(x.name in dyn for x in node.inputs):
+            for out in node.outputs:
+                if out.name:
+                    dyn.add(out.name)
+    return dyn
+
+
+def analyze_accumulators(
+    orig_model: ir.Model,
+    ranges: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+) -> list[dict[str, Any]]:
+    """Compute per-layer (and per-channel when available) accumulator bitwidths for Conv/MatMul/Gemm."""
+    dyn_tensors = _dynamic_tensor_names(orig_model)
+    results: list[dict[str, Any]] = []
+    for node_idx, node in enumerate(orig_model.graph):
+        if node.op_type not in ("Conv", "MatMul", "Gemm"):
+            continue
+        out_name = node.outputs[0].name
+        if out_name not in dyn_tensors or out_name not in ranges:
+            continue
+        vmin, vmax, vscale, vbias = ranges[out_name]
+        is_si = not (np.isnan(vscale).any() or np.isnan(vbias).any())
+        bitwidth: int | None = None
+        per_channel_bitwidths: list[int] | None = None
+        if is_si:
+            bitwidth = compute_accumulator_bitwidth(vmin, vmax)
+            if vmin.ndim >= 2 and vmin.shape[1] > 1:
+                ch_axes = tuple(i for i in range(vmin.ndim) if i != 1)
+                ch_min = np.min(vmin, axis=ch_axes)
+                ch_max = np.max(vmax, axis=ch_axes)
+                per_channel_bitwidths = [
+                    compute_accumulator_bitwidth(ch_min[c : c + 1], ch_max[c : c + 1])
+                    for c in range(vmin.shape[1])
+                ]
+        results.append({
+            "node": node.name or f"{node.op_type}_{node_idx}",
+            "op_type": node.op_type,
+            "tensor": out_name,
+            "is_scaled_int": is_si,
+            "bitwidth": bitwidth,
+            "per_channel_bitwidths": per_channel_bitwidths,
+        })
+    return results
+
+
+def detect_stuck_channels(
+    orig_model: ir.Model,
+    ranges: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    atol: float = 1e-6,
+) -> dict[str, dict[str, Any]]:
+    """Detect dynamic activation channels whose SIRA range collapses to a single constant."""
+    dyn_inputs = {i.name for i in orig_model.graph.inputs if i.const_value is None}
+    dyn_tensors = _dynamic_tensor_names(orig_model) - dyn_inputs
+    stuck: dict[str, dict[str, Any]] = {}
+    for tname, (vmin, vmax, vscale, vbias) in ranges.items():
+        if tname not in dyn_tensors:
+            continue
+        rmin, rmax = _real_range_from_tuple(vmin, vmax, vscale, vbias)
+        diff = rmax - rmin
+        if diff.ndim >= 2:
+            ch_axes = tuple(i for i in range(diff.ndim) if i != 1)
+            ch_max_diff = np.max(diff, axis=ch_axes) if ch_axes else diff
+            ch_indices = np.where(ch_max_diff <= atol)[0].tolist()
+            total_ch = int(diff.shape[1])
+        elif diff.ndim == 1:
+            ch_indices = np.where(diff <= atol)[0].tolist()
+            total_ch = int(diff.shape[0])
+        else:
+            ch_indices = [0] if float(diff) <= atol else []
+            total_ch = 1
+        if ch_indices:
+            stuck[tname] = {
+                "stuck_channels": ch_indices,
+                "total_channels": total_ch,
+            }
+    return stuck
+
+
 def evaluate_ranges(
     range_model: ir.Model,
     input_ranges: dict[str, tuple[np.ndarray, np.ndarray]] | list[tuple[np.ndarray, np.ndarray]],

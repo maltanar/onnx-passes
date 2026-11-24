@@ -11,7 +11,9 @@ from onnx.reference.op_run import OpRun
 from onnx_passes.ops.qonnx import DOMAIN as QONNX_DOMAIN
 from onnx_passes.passes.sira import (
     RangeAnalysis_v1,
+    analyze_accumulators,
     compute_accumulator_bitwidth,
+    detect_stuck_channels,
     evaluate_ranges,
 )
 
@@ -709,5 +711,45 @@ def test_name_preservation_roundtrip(tmp_path: Path):
     for tname in ("orig_in", "orig_mm", "orig_out"):
         assert tname in ranges
         assert np.all(ranges[tname][0] <= ranges[tname][1] + 1e-5)
+
+
+def test_accumulator_sizing_and_stuck_channels():
+    # Channel 0 is active, Channel 1 has bias=-20 so Relu clamps it to 0 (stuck!)
+    x = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    w_raw = _const("w_raw", np.array([[1.0, 1.0], [1.0, 1.0]], dtype=np.float32))
+    ws = _const("ws", np.array(1.0, dtype=np.float32))
+    wz = _const("wz", np.array(0.0, dtype=np.float32))
+    wbw = _const("wbw", np.array(4.0, dtype=np.float32))
+    wq = ir.Value(name="wq", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([2, 2]))
+    b = _const("b", np.array([0.0, -20.0], dtype=np.float32))
+    mm = ir.Value(name="mm", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    add_out = ir.Value(name="add_out", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    y = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    nodes = [
+        ir.Node(QONNX_DOMAIN, "Quant", [w_raw, ws, wz, wbw], attributes={"signed": ir.Attr("signed", ir.AttributeType.INT, 1), "narrow": ir.Attr("narrow", ir.AttributeType.INT, 0)}, outputs=[wq], name="wq_node"),
+        ir.Node("", "MatMul", [x, wq], outputs=[mm], name="mm_node"),
+        ir.Node("", "Add", [mm, b], outputs=[add_out], name="add_node"),
+        ir.Node("", "Relu", [add_out], outputs=[y], name="relu_node"),
+    ]
+    model = _make_model([x], [y], nodes, initializers=[w_raw, ws, wz, wbw, b], extra_opsets={QONNX_DOMAIN: 1})
+
+    lo = np.array([[-3.0, -3.0]], dtype=np.float32)
+    hi = np.array([[3.0, 3.0]], dtype=np.float32)
+    sc = {"x": (np.array(0.5, dtype=np.float32), np.array(0.0, dtype=np.float32))}
+    ranges = _run_sira(model, {"x": (lo, hi)}, input_scales=sc)
+
+    acc = analyze_accumulators(model, ranges)
+    assert len(acc) == 1
+    assert acc[0]["node"] == "mm_node"
+    assert acc[0]["is_scaled_int"] is True
+    # [-6, 6] needs 4 bits ([-8, 7])
+    assert acc[0]["bitwidth"] == 4
+    assert acc[0]["per_channel_bitwidths"] == [4, 4]
+
+    stuck = detect_stuck_channels(model, ranges)
+    assert "mm" not in stuck
+    assert stuck["y"]["stuck_channels"] == [1]
+    assert stuck["y"]["total_channels"] == 2
+
 
 
