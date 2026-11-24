@@ -40,6 +40,8 @@ Two modes exist depending on whether $v$ has an underlying scaled-integer repres
 | `IsZero` | `(x) -> scalar bool` | Returns `True` iff `x == 0` everywhere. |
 | `IsScalarValued` | `(x) -> scalar bool` | Returns `True` iff `ReduceMin(x) == ReduceMax(x)`. |
 | `ToRealRange` | `(v_min, v_max, v_scale, v_bias) -> (r_min, r_max)` | Converts any 4-tuple to real-valued `[r_min, r_max]`. |
+| `QuantEval` | `(x, scale, zeropoint, bitwidth) -> q` | Evaluates the integer quantization map $(g \circ f^{-1})(x)$. |
+| `FloatQuantEval` | `(val, s, exp_bw, man_bw, exp_bias, max_val) -> y` | Evaluates saturating round-to-even mini-float quantization on a single tensor. |
 
 ---
 
@@ -65,8 +67,8 @@ Two modes exist depending on whether $v$ has an underlying scaled-integer repres
   3. Output $y_{\min} = \min(q_{\text{low}}, q_{\text{high}})$, $y_{\max} = \max(q_{\text{low}}, q_{\text{high}})$, $y_{\text{scale}} = s$, $y_{\text{bias}} = 0$.
 
 ### 3.3 `Trunc` (`SiraTrunc_v1`)
-- **Inputs**: `x`, `s` (scale), `z` (zero-point), `in_bw`, `out_bw`.
-- **Attributes**: `rounding_mode` (int enum, default `2=FLOOR`).
+- **Inputs**: `x`, `s` (scale), `z` (zero-point), `in_bw`, `out_bw` (5-input QONNX `Trunc` v1 signature).
+- **Attributes**: `rounding_mode` (int enum, default `2=FLOOR`; explicitly handles `0=ROUND`, `1=CEIL`, `2=FLOOR`, defaulting other values to `FLOOR`).
 - **Constraints**: Always produces a scaled-integer output; `s`, `z`, `in_bw`, `out_bw` are constant.
 - **Operation**:
   1. Convert `x` to real-valued $[x_{\text{rmin}}, x_{\text{rmax}}]$.
@@ -75,11 +77,11 @@ Two modes exist depending on whether $v$ has an underlying scaled-integer repres
 
 ### 3.4 `FloatQuant` (`SiraFloatQuant_v1`)
 - **Inputs**: `x`, `s`, `exp_bw`, `man_bw`, `exp_bias`, `max_val`.
-- **Attributes**: `has_inf`, `has_nan`, `has_subnormal`, `rounding_mode`, `saturation`.
+- **Attributes**: `has_inf`, `has_nan`, `has_subnormal`, `rounding_mode`, `saturation` (accepted for schema compatibility; `FloatQuantEval_v1` currently implements saturating round-to-even, i.e., `saturation=1`, `rounding_mode="round"`).
 - **Constraints**: Floating-point quantization does **not** produce an integer component; output `scale` and `bias` are always `NaN`.
 - **Operation**:
   1. Convert `x` to real-valued $[x_{\text{rmin}}, x_{\text{rmax}}]$.
-  2. Evaluate the monotonic mini-float quantizer at both endpoints and output $[\min(y_{\text{low}}, y_{\text{high}}), \max(y_{\text{low}}, y_{\text{high}}), \text{NaN}, \text{NaN}]$.
+  2. Evaluate `FloatQuantEval` at both endpoints and output $[\min(y_{\text{low}}, y_{\text{high}}), \max(y_{\text{low}}, y_{\text{high}}), \text{NaN}, \text{NaN}]$.
 
 ---
 
@@ -136,10 +138,10 @@ Two modes exist depending on whether $v$ has an underlying scaled-integer repres
     - $s_Y = s_A \cdot s_B$ (reduced along $K$), $b_Y = b_A^{\text{full}} \cdot W_{\text{real}}$.
   - **Fallback**: Real-valued dot-product bounds using $W^+ = \max(W_{\text{real}}, 0)$, $W^- = \min(W_{\text{real}}, 0)$, and `NaN` scale/bias.
 
-### 5.2 `Gemm` (`SiraGemm_v1` / lowered in `RangeAnalysis_v1`)
+### 5.2 `Gemm` (`SiraGemm_v1` / decomposed in `RangeAnalysis_v1`)
 - **Inputs**: `a`, `b`, optional `c`.
 - **Attributes**: `alpha`, `beta`, `transA`, `transB`.
-- **Operation**: Handled by composing `SiraTranspose` (if `transA`/`transB`), `SiraMatMul`, `SiraMul` (if `alpha != 1` or `beta != 1`), and `SiraAdd` (if `c` is present).
+- **Operation**: `RangeAnalysis_v1` decomposes `Gemm` directly into `SiraTranspose` (if `transA`/`transB`), `SiraMatMul`, `SiraMul` (if `alpha != 1` or `beta != 1`), and `SiraAdd` (if `c` is present), avoiding dynamic `If` subgraphs during ONNX shape inference. (`SiraGemm_v1` is also provided in `onnx_passes.ops.sira` for 2-input `Gemm`.)
 
 ### 5.3 `Conv` (`SiraConv_v1`) and `DepthwiseConv` (`SiraDepthwiseConv_v1`)
 - **Inputs**: `x`, `w` (optional bias `b` is added via `SiraReshape` + `SiraAdd`).
@@ -160,7 +162,9 @@ Two modes exist depending on whether $v$ has an underlying scaled-integer repres
 - **Inputs**: `x`, `scale`, `b`, `mean`, `var`.
 - **Attributes**: `epsilon`, `momentum`.
 - **Constraints**: Inference mode (single output); parameters are constants. Propagates scaled-integers whenever `x` is scaled-integer.
-- **Operation**: Computes per-channel affine parameters $\gamma' = \text{scale} / \sqrt{\text{var} + \epsilon}$ and $\beta' = b - \text{mean} \cdot \gamma'$, then applies `SiraAdd(SiraMul(x, \gamma'), \beta')`.
+- **Operation**:
+  - **Scaled-Integer**: Computes per-channel affine parameters $\gamma' = \text{scale} / \sqrt{\text{var} + \epsilon}$ and $\beta' = b - \text{mean} \cdot \gamma'$, then applies `SiraAdd(SiraMul(x, \gamma'), \beta')`.
+  - **Non-Scaled-Integer Fallback**: Evaluates $(x_{\text{rmin}} - \text{mean}) \cdot \gamma' + b$ and $(x_{\text{rmax}} - \text{mean}) \cdot \gamma' + b$ directly (taking elementwise $\min/\max$ to handle $\gamma' < 0$) and outputs `NaN` scale/bias. Evaluating $(x - \text{mean}) \cdot \gamma' + b$ directly avoids float32 catastrophic cancellation when `var` is near zero.
 
 ---
 
@@ -177,8 +181,8 @@ Two modes exist depending on whether $v$ has an underlying scaled-integer repres
   - **Fallback**: $[\text{AvgPool}(x_{\text{rmin}}), \text{AvgPool}(x_{\text{rmax}}), \text{NaN}, \text{NaN}]$.
 
 ### 6.3 `Pad` (`SiraPad_v1`)
-- **Inputs**: `x`, `pads`, `constant_value`.
-- **Constraints for Scaled-Integer Propagation**: `x` is scaled-integer and `constant_value == x_bias` everywhere.
+- **Inputs**: `x`, `pads`, `constant_value` (`RangeAnalysis_v1` normalizes opset `< 11` attribute-based `Pad` into this 3-input form).
+- **Constraints for Scaled-Integer Propagation**: `x` is scaled-integer and `constant_value == x_bias` everywhere (checked regardless of `mode`).
 - **Operation**: Pads $q_X$ with `0` (preserving $s_X, b_X$) when constraints hold; otherwise pads $[x_{\text{rmin}}, x_{\text{rmax}}]$ with `constant_value` and outputs `NaN` scale/bias.
 
 ---
@@ -200,8 +204,8 @@ All non-linear operators below convert inputs to real-valued $[x_{\text{rmin}}, 
 | `Sigmoid` | `SiraSigmoid_v1` | $[\sigma(x_{\text{rmin}}),\; \sigma(x_{\text{rmax}})]$ |
 | `Tanh` | `SiraTanh_v1` | $[\tanh(x_{\text{rmin}}),\; \tanh(x_{\text{rmax}})]$ |
 | `Abs` | `SiraAbs_v1` | $[0 \text{ if } 0 \in [x_{\text{rmin}}, x_{\text{rmax}}] \text{ else } \min(|x_{\text{rmin}}|, |x_{\text{rmax}}|),\; \max(|x_{\text{rmin}}|, |x_{\text{rmax}}|)]$ |
-| `Pow` | `SiraPow_v1` | $\min/\max$ over $\{a_{\text{rmin}}^{b_{\text{rmin}}}, a_{\text{rmin}}^{b_{\text{rmax}}}, a_{\text{rmax}}^{b_{\text{rmin}}}, a_{\text{rmax}}^{b_{\text{rmax}}}\}$ (including $0$ if $0 \in [a_{\text{rmin}}, a_{\text{rmax}}]$ and $b_{\text{rmin}} > 0$) |
-| `Softmax` | `SiraSoftmax_v1` | $y_{\min, i} = \frac{e^{x_{\text{rmin}, i}}}{e^{x_{\text{rmin}, i}} + \sum_{j \neq i} e^{x_{\text{rmax}, j}}}$, $y_{\max, i} = \frac{e^{x_{\text{rmax}, i}}}{e^{x_{\text{rmax}, i}} + \sum_{j \neq i} e^{x_{\text{rmin}, j}}}$ (shifted by $\max(x_{\text{rmax}})$ for numerical stability) |
+| `Pow` | `SiraPow_v1` | $\min/\max$ over $\{a_{\text{rmin}}^{b_{\text{rmin}}}, a_{\text{rmin}}^{b_{\text{rmax}}}, a_{\text{rmax}}^{b_{\text{rmin}}}, a_{\text{rmax}}^{b_{\text{rmax}}}\}$ (including $0$ if $0 \in [a_{\text{rmin}}, a_{\text{rmax}}]$ and $b_{\text{rmin}} > 0$; assumes real-valued power at endpoints) |
+| `Softmax` | `SiraSoftmax_v1` | $y_{\min, i} = \frac{e^{x_{\text{rmin}, i}}}{e^{x_{\text{rmin}, i}} + \sum_{j \neq i} e^{x_{\text{rmax}, j}}}$, $y_{\max, i} = \frac{e^{x_{\text{rmax}, i}}}{e^{x_{\text{rmax}, i}} + \sum_{j \neq i} e^{x_{\text{rmin}, j}}}$ (shifted by $\max(x_{\text{rmax}})$ for stability; takes `axes: INTS` from `axis`) |
 
 ---
 
@@ -216,3 +220,10 @@ All non-linear operators below convert inputs to real-valued $[x_{\text{rmin}}, 
 - **`Unsqueeze` (`SiraUnsqueeze_v1`)**: Unsqueezes `x_min` and `x_max` along `axes`, outputting `NaN` scale/bias.
 - **`Concat` (`SiraConcat2_v1`, pairwise chained)**: Concatenates `min` and `max` along `axis`, outputting `NaN` scale/bias.
 - **`Cast` (`SiraCast_v1`)**: Casts `x_min` and `x_max` to target dtype `to`, outputting `NaN` scale/bias.
+
+---
+
+## 9. Graph-Level Notes
+
+- **Opset Target**: `RangeAnalysis_v1` upgrades the range-analysis graph's default ONNX opset to $\ge 18$ so all `onnx_passes.ops.sira` ONNX functions use modern ONNX operator signatures.
+- **Scope**: Only single-output operators in the set above are currently supported; unsupported multi-output or composite ops should be lowered prior to `RangeAnalysis_v1`.
