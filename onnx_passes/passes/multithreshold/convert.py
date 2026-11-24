@@ -157,3 +157,51 @@ class RewriteRoundAsMultiThreshold_v1(RewriteRule, Verify):
             # counting steps: Shift the output up/down to have f(0)=0.
             op.Round(minimum)
         )
+
+
+@tolerance
+class RewriteStepAsMultiThreshold_v1(RewriteRule, Verify):
+    """Rewrite a single step selecting between constants as MultiThreshold.
+
+    Covers the bipolar quantizer core Where(x >= t, +1, -1), but generally any
+    Where(x >= t, a, b) with constant threshold t and constant levels a, b,
+    which equals b + (a - b) * [x >= t].
+    """
+
+    @staticmethod
+    def pattern(op, x, threshold, a, b):
+        return op.Where(op.GreaterOrEqual(x, threshold), a, b)
+
+    @staticmethod
+    def check(context, x, threshold, a, b):
+        for value in (threshold, a, b):
+            if ir.convenience.get_const_tensor(value) is None:
+                return False
+        return ir.convenience.get_const_tensor(x) is None
+
+    @staticmethod
+    def rewrite_v13(op, x, threshold, a, b):
+        # Threshold reduction over a single step weighted by the difference of
+        # the two levels, starting from the lower level b.
+        return op.Add(
+            op.ReduceSum(
+                op.Mul(
+                    op.Unsqueeze(op.Sub(a, b), op.Constant(value_ints=[-1])),
+                    op.CastLike(
+                        op.GreaterOrEqual(
+                            # Append the thresholding dimension to the input
+                            # tensor which is later removed by the reduction.
+                            op.Unsqueeze(x, op.Constant(value_ints=[-1])),
+                            op.Unsqueeze(
+                                threshold, op.Constant(value_ints=[-1])
+                            )
+                        ),
+                        a
+                    )
+                ),
+                # Reduce over the thresholding dimension and delete this axis
+                # afterward to restore the original input shape.
+                op.Constant(value_ints=[-1]), keepdims=0
+            ),
+            b
+        )

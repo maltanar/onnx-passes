@@ -418,6 +418,55 @@ class InlineBrevitasQuant_v1(InlineQONNXQuant_v1, Verify):
         )
 
 
+class InlineQONNXBipolarQuant_v1(RewriteRule, Verify):
+    """Inline QONNX custom bipolar quantizer into the graph."""
+
+    @staticmethod
+    def pattern(op, x, s):
+        return op.BipolarQuant(x, s, _domain=QONNX_DOMAIN)
+
+    @staticmethod
+    def rewrite(op, x, s):
+        # Bipolar encoding with the decision boundary at zero: q >= 0 is
+        # encoded as +1 and q < 0 as -1
+        q = op.Where(
+            op.GreaterOrEqual(
+                x,
+                op.CastLike(
+                    op.Constant(value_float=0.0),
+                    x
+                )
+            ),
+            op.CastLike(
+                op.Constant(value_float=+1.0),
+                x
+            ),
+            op.CastLike(
+                op.Constant(value_float=-1.0),
+                x
+            )
+        )
+
+        # Multiply quantized value by scale: Integer to float dequantization.
+        return op.Mul(
+            # If this quantizer is on a constant/parameter path, block the
+            # flow of constant-folding at the quantized values.
+            op.ConstantStop(
+                q,
+                _domain=PASSES_DOMAIN
+            ),
+            s
+        )
+
+
+class InlineBrevitasBipolarQuant_v1(InlineQONNXBipolarQuant_v1, Verify):
+    """Inline QONNX custom bipolar quantizer (Brevitas domain) into the graph."""
+
+    @staticmethod
+    def pattern(op, x, s):
+        return op.BipolarQuant(x, s, _domain=BREVITAS_DOMAIN)
+
+
 class InlineQuantizer_v1(Sequential):
     """Apply quantizer inlining transformations."""
 
@@ -425,4 +474,6 @@ class InlineQuantizer_v1(Sequential):
         InlineQuant_v1,
         InlineQONNXQuant_v1,
         InlineBrevitasQuant_v1,
+        InlineQONNXBipolarQuant_v1,
+        InlineBrevitasBipolarQuant_v1,
     ]
