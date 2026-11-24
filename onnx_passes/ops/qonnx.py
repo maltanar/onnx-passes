@@ -97,6 +97,9 @@ class Quant_v1(OnnxOperator, domain=DOMAIN):
 
             # Divide input by scale and shift by zeropoint: Float to integer
             # quantization, still with fractional part and can be out of range.
+            # The zero point might be of integer type (non-standard, but
+            # accepted by QONNX), cast to match the input
+            zeropoint = op.CastLike(zeropoint, x)
             q = op.Add(op.Div(x, scale), zeropoint)
 
             # Clipping to the integer range, used in all rounding mode branches
@@ -242,3 +245,32 @@ class Quant_v1(OnnxOperator, domain=DOMAIN):
             return op.Mul(op.Sub(q, zeropoint), scale)
 
         return quant
+
+
+class BipolarQuant_v1(OnnxOperator, domain=DOMAIN):
+    """QONNX binary (bipolar) quantization custom operator.
+
+    Quantizes to +1 for x >= 0 and -1 otherwise, then multiplies by the scale.
+
+    See https://github.com/fastmachinelearning/qonnx for details.
+    """
+
+    @staticmethod
+    def script(op: Opset):
+        """Generate an ONNX Script function implementing BipolarQuant."""
+
+        def bipolar_quant(x, scale):
+            # Bipolar encoding with the decision boundary at zero
+            q = op.Where(
+                op.GreaterOrEqual(
+                    x,
+                    op.CastLike(op.Constant(value_float=0.0), x)
+                ),
+                op.CastLike(op.Constant(value_float=+1.0), x),
+                op.CastLike(op.Constant(value_float=-1.0), x)
+            )
+
+            # Integer to float dequantization
+            return op.Mul(q, scale)
+
+        return bipolar_quant
