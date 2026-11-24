@@ -176,3 +176,57 @@ Next gaps:
 - SIRA handlers for comparisons, `Where`, `Cast` and `CastLike` (handoff
   follow-up).
 - `Trunc` inlining (rn8, MobileNet).
+
+### Checkpoint 3 (2026-11-24): SIRA follow-up merged, Trunc inlined
+
+`feature/sira` 3ca43e5 (handlers for comparisons, `Where`, `CastLike` and
+`Cast`) is merged. **Pytest: 16/16 zoo models pass**, together with
+`test_sira.py` and `test_sira_zoo.py` (55 tests in total). All repo demos
+still verify.
+
+| Model | Linear before | Linear after P1 | Quant before -> after P2 | MultiThreshold | Max err P1/P2 |
+|---|---:|---:|---:|---:|---:|
+| CNV_1W1A / 1W2A / 2W2A, cnv_1w1a_gtsrb | 8/1/0 | 9/0/0 | 9 -> 0 | 9 | ≤ 4.8e-7 |
+| TFC_1W1A / 1W2A / 2W2A | 4/0/0 | 4/0/0 | 4 -> 0 | 4 | ≤ 2.4e-7 |
+| LFC_1W1A / 1W2A | 4/0/0 | 4/0/0 | 4 -> 0 | 4 | ≤ 4.8e-7 |
+| unsw_nb15-mlp-w2a2 | 0/4/0 | 3/1/0 | 4 -> 0 | 4 | 0 |
+| kwsmlp_w3a3 | 0/4/0 | 4/0/0 | 4 -> 0 | 4 | 4.8e-7 |
+| cloudsatnet_qat_4bit_exsi | 0/12/0 | 12/0/0 | 12 -> 0 | 12 | 4.8e-7 |
+| 2W2A_rn8_pow2 | 0/10/0 | 9/1/0 | 13 -> 1 | 12 | 0 |
+| 3W3A_rn8_fp | 0/10/0 | 9/1/0 | 12 -> 1 | 11 | 4.8e-7 |
+| mobilenet_4W4A | 0/28/0 | 27/1/0 | 28 -> 1 | 27 | 4.8e-7 |
+| qkeras_jettagging | 0/3/1 | 3/0/1 | 3 -> 0 | 3 | 0 |
+
+What remains, all expected:
+
+- **Non-int linear ops after phase 1** read the model input directly (scaled-int
+  or float input spec): the first layer of rn8, MobileNet, UNSW and JetTagging.
+- **The residual quantizer in rn8 and MobileNet** is the `Round` inside the
+  global-pool `Trunc`. Trunc v1 has no clamp, so its integer range is unbounded
+  and cannot be expressed as a finite set of thresholds.
+
+Changes:
+
+- **Trunc:**
+  - Op functions for QONNX opset versions 1 and 2 (`ops/qonnx.py`) and for
+    Brevitas v1 (`ops/brevitas.py`).
+  - Inlining (`inline/quantizer.py`) tells the versions apart by input count:
+    5 inputs is v1, 6 is v2.
+  - v2 clamps to the output bitwidth and rescales by the output scale. v1
+    rescales by the input scale, as in the specification.
+  - The zoo models only use v1 (`onnx.brevitas`, FLOOR).
+  - A spec-conformance test covers 30 cases: v1/v2, both domains, all rounding
+    modes, zero points, and signed/narrow.
+  - Rounding modes in op functions are compared longest-first, because the ONNX
+    reference evaluator refuses to compare strings of different length. As a
+    result, CEIL cannot be dispatched by the reference evaluator. The existing
+    `Quant` function has the same limitation; inlining is not affected.
+- **Function inlining blacklist** now includes `BipolarQuant` and `Trunc`:
+  - Generic function inlining in `canonicalize` expanded them before the
+    dedicated rules ran.
+  - For `Trunc`, this left a string-valued `If` that broke initializer
+    deduplication.
+  - For `BipolarQuant`, the weight `ConstantStop` was skipped.
+- **`MoveChannelMulPastDepthwiseConvInput_v1`** (`reorder/linear.py`): moves a
+  per-channel input scale past a depthwise Conv (`group == C_in`, any channel
+  multiplier). It covers MobileNet's 12 depthwise Convs (15/13/0 -> 27/1/0).
