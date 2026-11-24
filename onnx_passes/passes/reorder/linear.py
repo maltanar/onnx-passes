@@ -294,3 +294,79 @@ class MoveMulPastPad_v1(RewriteRule, Verify):
             op.Pad(x, pads, const_value, axes, mode=mode),
             op.Constant(value=ir.tensor(np.ascontiguousarray(scale)))
         )
+
+
+@tolerance
+class MoveChannelMulPastDepthwiseConvInput_v1(RewriteRule, Verify):
+    """Reorder per-channel multiplication of the input past depthwise Conv.
+
+    For depthwise convolutions, i.e., group equals the number of input
+    channels, every output channel only depends on a single input channel:
+    Conv(s * x, w) = Conv(x, w) * s' where s' repeats the per-channel scale s
+    for each of the m = C_out / C_in output channels of an input channel. Zero
+    padding is invariant to scaling. A bias is split off as an explicit Add.
+    """
+
+    @property
+    def commute(self) -> bool:
+        return True
+
+    @staticmethod
+    def pattern(op, x, w, s):
+        return op.Conv(
+            op.Mul(s, x), w, _allow_other_inputs=True, _outputs=["out"]
+        )
+
+    @staticmethod
+    def check(context, x, w, s, out):
+        node = out.producer()
+
+        if (value := _broadcast_to_operand(s, x)) is None or value.ndim < 3:
+            return False
+
+        # Effectively scalar s is covered by MoveScalarMulPastConvInput_v1
+        if _is_scalar(value):
+            return False
+
+        if (group := node.attributes.get("group")) is None:
+            return False
+
+        if (shape := _static_shape(w)) is None:
+            return False
+
+        channels = value.shape[1]
+        if group.as_int() != channels or shape[0] % channels != 0:
+            return False
+
+        if len(node.inputs) > 2 and node.inputs[2]:
+            if _static_shape(node.inputs[2]) is None:
+                return False
+
+        # Scale must only vary along the channel axis
+        index = (slice(0, 1), slice(None), *(slice(0, 1),) * (value.ndim - 2))
+        return bool(np.all(value == value[index]))
+
+    @staticmethod
+    def rewrite(op, x, w, s, out):
+        node = out.producer()
+        value = _broadcast_to_operand(s, x)
+        rank = value.ndim
+
+        # Per-channel scale repeated for each output channel of the group
+        scale = value[(0, slice(None), *(0,) * (rank - 2))]
+        scale = np.repeat(scale, _static_shape(w)[0] // scale.shape[0])
+        scale = np.reshape(scale, (-1, *(1,) * (rank - 2)))
+
+        y = op.Mul(
+            op.Conv(x, w, **node.attributes),
+            op.Constant(value=ir.tensor(np.ascontiguousarray(scale)))
+        )
+
+        if len(node.inputs) > 2 and (b := node.inputs[2]):
+            y = op.Add(
+                y, op.Reshape(
+                    b, op.Constant(value_ints=[-1, *(1,) * (rank - 2)])
+                )
+            )
+
+        return y
