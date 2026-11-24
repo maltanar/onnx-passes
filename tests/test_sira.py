@@ -1,4 +1,4 @@
-import glob
+import os
 from pathlib import Path
 
 import numpy as np
@@ -330,11 +330,23 @@ def test_softmax_and_pooling():
     _assert_sound(model, ranges, {"x": (lo, hi)}, n_samples=10)
 
 
-@pytest.mark.parametrize(
-    "model_path",
-    sorted(glob.glob("/data/sandbox/qonnx_model_zoo/models/**/*.onnx", recursive=True)),
+def _qonnx_zoo_models() -> list[Path]:
+    """Collect .onnx models under $QONNX_MODEL_ZOO (empty if unset)."""
+    root = os.environ.get("QONNX_MODEL_ZOO")
+    if not root:
+        return []
+    return sorted(Path(root).expanduser().rglob("*.onnx"))
+
+
+_QONNX_ZOO_MODELS = _qonnx_zoo_models()
+
+
+@pytest.mark.skipif(
+    not _QONNX_ZOO_MODELS,
+    reason="set QONNX_MODEL_ZOO to the QONNX model zoo's models/ directory",
 )
-def test_qonnx_model_zoo(model_path: str):
+@pytest.mark.parametrize("model_path", _QONNX_ZOO_MODELS, ids=lambda p: p.stem)
+def test_qonnx_model_zoo(model_path: Path):
     """Run SIRA RangeAnalysis_v1 on every model in the QONNX model zoo."""
     orig = ir.load(model_path)
     out_names = [o.name for o in orig.graph.outputs]
@@ -348,7 +360,7 @@ def test_qonnx_model_zoo(model_path: str):
         )
 
     rm = RangeAnalysis_v1()(orig).model
-    import pdb; pdb.set_trace()
+
     ranges = evaluate_ranges(rm, inp_ranges, backend="onnxruntime", intermediates=True)
     assert len(ranges) > 0
     for out_name in out_names:

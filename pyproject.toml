@@ -23,6 +23,7 @@ dependencies = [
     "onnx>=1.17.0",
     "onnx-ir>=0.1.15",
     "onnxscript>=0.7.0",
+    "onnxruntime>=1.20.0",
     "netron>=8.0.0",
     "PyYAML>=6.0.0",
     "numpy>=1.26.4",
@@ -31,6 +32,13 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "rich>=13.0.0",
     "scipy<2.0.0"
+]
+
+# Optional dependencies: install via `pip install -e .[test]`
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0"
 ]
 
 [project.urls]
@@ -58,3 +66,7 @@ version = "0.0.0"
 poetry-dynamic-versioning = { version = ">=1.0.0,<2.0.0", extras = ["plugin"] }
 [tool.poetry-dynamic-versioning]
 enable = true
+
+# Pytest configuration: collect tests from the tests directory
+[tool.pytest.ini_options]
+testpaths = ["tests"]
