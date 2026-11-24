@@ -35,6 +35,7 @@ _DIRECT_OPS = {
     "Round",
     "Shape",
     "Sigmoid",
+    "Sign",
     "Sqrt",
     "Sub",
     "Tanh",
@@ -504,7 +505,9 @@ class RangeAnalysis_v1(Transformation):
                     lo_in = const_tuple(np.array(_attr_float(node, "min", -np.inf), dtype=np.float32), "clip_min")
                     hi_in = const_tuple(np.array(_attr_float(node, "max", np.inf), dtype=np.float32), "clip_max")
                 range_map[out_val] = emit_sira_node(
-                    "Clip", [*get_in(0), *lo_in, *hi_in], {}, tag_name=out_name
+                    "Clip", [*get_in(0), *lo_in, *hi_in], {}, tag_name=out_name,
+                    out_shape=out_val.shape or range_map[node.inputs[0]][0].shape,
+                    out_type=out_val.type,
                 )
 
             elif op_type == "Unsqueeze":
@@ -557,6 +560,36 @@ class RangeAnalysis_v1(Transformation):
                             tag_name=out_name if is_last else None,
                             out_shape=c_shape if is_last else None,
                             out_type=c_type if is_last else None,
+                        )
+                    range_map[out_val] = acc
+
+            elif op_type in ("Max", "Min"):
+                if len(node.inputs) == 0:
+                    raise ValueError(f"SIRA {op_type} node requires at least 1 input")
+                mm_shape = out_val.shape
+                if mm_shape is None:
+                    shapes = [range_map[inp][0].shape for inp in node.inputs]
+                    if all(s is not None and s.is_static() for s in shapes):
+                        try:
+                            mm_shape = ir.Shape(np.broadcast_shapes(*(tuple(s.dims) for s in shapes)))
+                        except ValueError:
+                            mm_shape = None
+                if len(node.inputs) == 1:
+                    range_map[out_val] = emit_sira_node(
+                        "Identity", flat_inputs([0]), {}, tag_name=out_name,
+                        out_shape=mm_shape, out_type=out_val.type,
+                    )
+                else:
+                    acc = get_in(0)
+                    for i in range(1, len(node.inputs)):
+                        is_last = i == len(node.inputs) - 1
+                        acc = emit_sira_node(
+                            op_type,
+                            [*acc, *get_in(i)],
+                            {},
+                            tag_name=out_name if is_last else None,
+                            out_shape=mm_shape if is_last else None,
+                            out_type=out_val.type if is_last else None,
                         )
                     range_map[out_val] = acc
 
@@ -626,7 +659,7 @@ class RangeAnalysis_v1(Transformation):
                 inferred_shape = out_val.shape
                 if inferred_shape is None:
                     s0 = range_map[node.inputs[0]][0].shape
-                    if op_type in {"Quant", "BipolarQuant", "Trunc", "FloatQuant", "Relu", "BatchNormalization", "Ceil", "Floor", "Round", "Log", "Exp", "Sqrt", "Sigmoid", "Tanh", "Abs", "Neg", "Identity", "Cast"}:
+                    if op_type in {"Quant", "BipolarQuant", "Trunc", "FloatQuant", "Relu", "BatchNormalization", "Ceil", "Floor", "Round", "Sign", "Log", "Exp", "Sqrt", "Sigmoid", "Tanh", "Abs", "Neg", "Identity", "Cast"}:
                         inferred_shape = s0
                     elif op_type in {"Add", "Sub", "Mul", "Div", "Pow"}:
                         s1 = range_map[node.inputs[1]][0].shape

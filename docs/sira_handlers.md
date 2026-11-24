@@ -171,10 +171,9 @@ Two modes exist depending on whether $v$ has an underlying scaled-integer repres
 ## 6. Pooling and Padding Operators
 
 ### 6.1 `MaxPool` (`SiraMaxPool_v1`)
-- **Constraints for Scaled-Integer Propagation**: `x` is scaled-integer, and both `x_scale` and `x_bias` are spatially constant across `spatial_axes`.
+- **Constraints for Scaled-Integer Propagation**: `x` is scaled-integer, `x_scale > 0` everywhere, and both `x_scale` and `x_bias` are spatially constant across `spatial_axes`.
 - **Operation**:
-  - **Scaled-Integer ($s_X \ge 0$)**: $[\text{MaxPool}(q_{X,\min}),\; \text{MaxPool}(q_{X,\max}),\; s_X,\; b_X]$.
-  - **Scaled-Integer ($s_X < 0$)**: $[-\text{MaxPool}(-q_{X,\max}),\; -\text{MaxPool}(-q_{X,\min}),\; s_X,\; b_X]$.
+  - **Scaled-Integer**: $[\text{MaxPool}(q_{X,\min}),\; \text{MaxPool}(q_{X,\max}),\; s_X,\; b_X]$.
   - **Fallback**: $[\text{MaxPool}(x_{\text{rmin}}), \text{MaxPool}(x_{\text{rmax}}), \text{NaN}, \text{NaN}]$.
 
 ### 6.2 `AveragePool` (`SiraAveragePool_v1`)
@@ -192,15 +191,26 @@ Two modes exist depending on whether $v$ has an underlying scaled-integer repres
 
 ## 7. Non-Linear & Monotonic Elementwise Operators
 
-All non-linear operators below convert inputs to real-valued $[x_{\text{rmin}}, x_{\text{rmax}}]$ and output `NaN` for `scale` and `bias`:
+### 7.1 `Max` and `Min` (`SiraMax_v1`, `SiraMin_v1`)
+- **Variadic Dispatch**: Binary inputs use `SiraMax_v1`/`SiraMin_v1` directly; $> 2$ inputs are chained pairwise; single-input nodes pass through via `SiraIdentity_v1`.
+- **Constraints for Scaled-Integer Propagation**:
+  1. **Inactive constant**: If one operand is a constant $c$ that never becomes active ($c \le a_{\text{rmin}}$ everywhere for `Max`; $c \ge a_{\text{rmax}}$ everywhere for `Min`) and the other operand is scaled-integer, the active operand's 4-tuple is passed through (broadcast to the output shape).
+  2. **Grid-aligned constant**: If one operand is scaled-integer $(q, s, b)$ with $s \ne 0$ everywhere and the other is a constant $c$ such that $k = (c - b) / s$ is an integer everywhere within relative tolerance $10^{-5} \cdot \max(1, |k|)$, the output retains $(s, b)$ with per-element sign-aware clamping: for `Max`, `Where(s > 0, max(q, k), min(q, k))` applied to both endpoints and reordered so $q_{\min} \le q_{\max}$ (`Min` is symmetric). Either argument position can be the constant.
+  3. **Identical scaled-int operands**: If both operands are scaled-integer with equal `scale` and `bias` everywhere, `Max`/`Min` is applied directly to $q$ (with the same sign-aware reordering), preserving $(s, b)$.
+- **Fallback**: Real-valued $[\max(a_{\text{rmin}}, b_{\text{rmin}}), \max(a_{\text{rmax}}, b_{\text{rmax}})]$ (or $\min$) with `NaN` scale/bias.
+
+### 7.2 `Relu` and `Clip` (`SiraRelu_v1`, `SiraClip_v1`)
+- **`Relu` (`SiraRelu_v1`)**: Equivalent to `SiraMax_v1(x, 0)`, preserving $(s_X, b_X)$ when $0$ is on $x$'s grid or inactive ($x_{\text{rmin}} \ge 0$), and falling back to `NaN` scale/bias otherwise.
+- **`Clip` (`SiraClip_v1`)**: Composes `SiraMin_v1(SiraMax_v1(x, lo), hi)` (missing `lo`/`hi` default to $-\infty$ / $+\infty$, which are always inactive).
+
+### 7.3 Integer-Producing Rounding / Sign Operators (`Round`, `Floor`, `Ceil`, `Sign`)
+- **Operation**: Convert input to real-valued $[x_{\text{rmin}}, x_{\text{rmax}}]$ via `ToRealRange`, apply the monotonic operator $R \in \{\text{Round}, \text{Floor}, \text{Ceil}, \text{Sign}\}$ to both endpoints, and always output integer `scale = 1.0`, `bias = 0.0` (whether the input was scaled-integer or real-valued).
+
+### 7.4 Real-Valued Non-Linear Operators (Always `NaN` Scale/Bias)
+All remaining non-linear operators below convert inputs to real-valued $[x_{\text{rmin}}, x_{\text{rmax}}]$ and output `NaN` for `scale` and `bias`:
 
 | Operator | Handler | Interval Formula |
 | --- | --- | --- |
-| `Relu` | `SiraRelu_v1` | $[\max(x_{\text{rmin}}, 0),\; \max(x_{\text{rmax}}, 0)]$ |
-| `Clip` | `SiraClip_v1` | $[\text{clip}(x_{\text{rmin}}, \text{lo}, \text{hi}),\; \text{clip}(x_{\text{rmax}}, \text{lo}, \text{hi})]$ |
-| `Ceil` | `SiraCeil_v1` | $[\lceil x_{\text{rmin}} \rceil,\; \lceil x_{\text{rmax}} \rceil]$ |
-| `Floor` | `SiraFloor_v1` | $[\lfloor x_{\text{rmin}} \rfloor,\; \lfloor x_{\text{rmax}} \rfloor]$ |
-| `Round` | `SiraRound_v1` | $[\text{round}(x_{\text{rmin}}),\; \text{round}(x_{\text{rmax}})]$ |
 | `Log` | `SiraLog_v1` | $[\ln(x_{\text{rmin}}),\; \ln(x_{\text{rmax}})]$ |
 | `Exp` | `SiraExp_v1` | $[\exp(x_{\text{rmin}}),\; \exp(x_{\text{rmax}})]$ |
 | `Sqrt` | `SiraSqrt_v1` | $[\sqrt{x_{\text{rmin}}},\; \sqrt{x_{\text{rmax}}}]$ |

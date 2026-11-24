@@ -622,7 +622,8 @@ def test_batchnorm_and_pooling_and_pad():
     ranges = _run_sira(model, {"x": (lo, hi)}, input_scales=sc)
     assert not np.isnan(ranges["bn_out"][2]).any()
     assert not np.isnan(ranges["ap_out"][2]).any()
-    assert not np.isnan(ranges["mp_out"][2]).any()
+    # Channel 1 has negative scale -> MaxPool falls back to real-valued
+    assert np.isnan(ranges["mp_out"][2]).all()
     assert np.isnan(ranges["y"][2]).all()
     _assert_sound(model, ranges, {"x": (lo, hi)}, input_scales=sc, n_samples=5)
 
@@ -801,6 +802,212 @@ def test_summarize_ranges_and_cli(tmp_path):
     assert data["accumulators"][0]["bitwidth"] == 4
     assert data["stuck_channels"]["y"]["stuck_channels"] == [1]
     assert data["ranges"]["y"]["channel_real_max"] == [3.0, 0.0]
+
+
+def test_round_floor_ceil_integer_outputs():
+    for op_type, exp_lo, exp_hi in [
+        ("Round", -2.0, 2.0),
+        ("Floor", -2.0, 2.0),
+        ("Ceil", -1.0, 3.0),
+    ]:
+        x = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 3]))
+        y = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 3]))
+        model = _make_model([x], [y], [ir.Node("", op_type, [x], outputs=[y])])
+
+        # Real-valued input -> scale=1, bias=0
+        lo_f = np.full((1, 3), -1.7, dtype=np.float32)
+        hi_f = np.full((1, 3), 2.3, dtype=np.float32)
+        r_real = _run_sira(model, {"x": (lo_f, hi_f)})
+        np.testing.assert_allclose(r_real["y"][0], exp_lo)
+        np.testing.assert_allclose(r_real["y"][1], exp_hi)
+        np.testing.assert_allclose(r_real["y"][2], 1.0)
+        np.testing.assert_allclose(r_real["y"][3], 0.0)
+        _assert_sound(model, r_real, {"x": (lo_f, hi_f)}, n_samples=6)
+
+        # Scaled-int input with non-integer scale -> scale=1, bias=0
+        lo_q = np.full((1, 3), -3.0, dtype=np.float32)
+        hi_q = np.full((1, 3), 4.0, dtype=np.float32)
+        sc = {"x": (np.array(0.35, dtype=np.float32), np.array(0.1, dtype=np.float32))}
+        r_si = _run_sira(model, {"x": (lo_q, hi_q)}, input_scales=sc)
+        np.testing.assert_allclose(r_si["y"][2], 1.0)
+        np.testing.assert_allclose(r_si["y"][3], 0.0)
+        _assert_sound(model, r_si, {"x": (lo_q, hi_q)}, input_scales=sc, n_samples=6)
+
+
+def test_max_min_scaled_int_cases():
+    # 1. Grid-aligned constant (either input position) -> scaled-int kept
+    for const_first in (False, True):
+        for op_type in ("Max", "Min"):
+            x = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+            c = _const("c", np.array(0.25, dtype=np.float32))  # 0.25 = 0.5 * 1 - 0.25 (on grid)
+            y = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+            ins = [c, x] if const_first else [x, c]
+            m = _make_model([x], [y], [ir.Node("", op_type, ins, outputs=[y])], initializers=[c])
+            lo = np.full((1, 2), -2.0, dtype=np.float32)
+            hi = np.full((1, 2), 3.0, dtype=np.float32)
+            sc = {"x": (np.array(0.5, dtype=np.float32), np.array(-0.25, dtype=np.float32))}
+            r = _run_sira(m, {"x": (lo, hi)}, input_scales=sc)
+            np.testing.assert_allclose(r["y"][2], 0.5)
+            np.testing.assert_allclose(r["y"][3], -0.25)
+            if op_type == "Max":
+                np.testing.assert_allclose(r["y"][0], 1.0)
+                np.testing.assert_allclose(r["y"][1], 3.0)
+            else:
+                np.testing.assert_allclose(r["y"][0], -2.0)
+                np.testing.assert_allclose(r["y"][1], 1.0)
+            _assert_sound(m, r, {"x": (lo, hi)}, input_scales=sc, n_samples=6)
+
+    # 2. Off-grid active constant -> falls back to NaN
+    x2 = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    c_off = _const("c_off", np.array(0.3, dtype=np.float32))
+    y2 = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    m_off = _make_model([x2], [y2], [ir.Node("", "Max", [x2, c_off], outputs=[y2])], initializers=[c_off])
+    lo = np.full((1, 2), -2.0, dtype=np.float32)
+    hi = np.full((1, 2), 3.0, dtype=np.float32)
+    sc = {"x": (np.array(0.5, dtype=np.float32), np.array(0.0, dtype=np.float32))}
+    r_off = _run_sira(m_off, {"x": (lo, hi)}, input_scales=sc)
+    assert np.isnan(r_off["y"][2]).all()
+    _assert_sound(m_off, r_off, {"x": (lo, hi)}, input_scales=sc, n_samples=5)
+
+    # 3. Off-grid inactive constant -> scaled-int kept
+    x3 = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    y3 = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    c_inact = _const("c_inact", np.array(-10.3, dtype=np.float32))
+    m_inact = _make_model([x3], [y3], [ir.Node("", "Max", [x3, c_inact], outputs=[y3])], initializers=[c_inact])
+    r_inact = _run_sira(m_inact, {"x": (lo, hi)}, input_scales=sc)
+    np.testing.assert_allclose(r_inact["y"][2], 0.5)
+    np.testing.assert_allclose(r_inact["y"][0], -2.0)
+    np.testing.assert_allclose(r_inact["y"][1], 3.0)
+    _assert_sound(m_inact, r_inact, {"x": (lo, hi)}, input_scales=sc, n_samples=5)
+
+    # 4. Negative scale and per-channel mixed-sign scales
+    x4 = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    y4 = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    c_mix = _const("c_mix", np.array([1.0, 1.0], dtype=np.float32))
+    m_mix = _make_model([x4], [y4], [ir.Node("", "Max", [x4, c_mix], outputs=[y4])], initializers=[c_mix])
+    sc_neg = {"x": (np.array(-0.5, dtype=np.float32), np.array(0.0, dtype=np.float32))}
+    r_neg = _run_sira(m_mix, {"x": (lo, hi)}, input_scales=sc_neg)
+    np.testing.assert_allclose(r_neg["y"][2], -0.5)
+    np.testing.assert_allclose(r_neg["y"][0], -2.0)
+    np.testing.assert_allclose(r_neg["y"][1], -2.0)
+    _assert_sound(m_mix, r_neg, {"x": (lo, hi)}, input_scales=sc_neg, n_samples=5)
+
+    sc_mix = {"x": (np.array([[0.5, -0.5]], dtype=np.float32), np.array([[0.0, 0.0]], dtype=np.float32))}
+    r_mix = _run_sira(m_mix, {"x": (lo, hi)}, input_scales=sc_mix)
+    np.testing.assert_allclose(r_mix["y"][2], np.array([[0.5, -0.5]], dtype=np.float32))
+    np.testing.assert_allclose(r_mix["y"][0], np.array([[2.0, -2.0]], dtype=np.float32))
+    np.testing.assert_allclose(r_mix["y"][1], np.array([[3.0, -2.0]], dtype=np.float32))
+    _assert_sound(m_mix, r_mix, {"x": (lo, hi)}, input_scales=sc_mix, n_samples=5)
+
+
+def test_relu_and_clip_scaled_int():
+    x = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    y = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    m_relu = _make_model([x], [y], [ir.Node("", "Relu", [x], outputs=[y])])
+    lo = np.full((1, 2), -3.0, dtype=np.float32)
+    hi = np.full((1, 2), 4.0, dtype=np.float32)
+
+    # Zero point on grid (bias = -0.5, scale = 0.5 -> k = 1) -> scaled-int kept
+    sc_on = {"x": (np.array(0.5, dtype=np.float32), np.array(-0.5, dtype=np.float32))}
+    r_on = _run_sira(m_relu, {"x": (lo, hi)}, input_scales=sc_on)
+    np.testing.assert_allclose(r_on["y"][2], 0.5)
+    np.testing.assert_allclose(r_on["y"][3], -0.5)
+    np.testing.assert_allclose(r_on["y"][0], 1.0)
+    np.testing.assert_allclose(r_on["y"][1], 4.0)
+    _assert_sound(m_relu, r_on, {"x": (lo, hi)}, input_scales=sc_on, n_samples=5)
+
+    # Zero point off grid (bias = 0.2, scale = 0.5) -> falls back to NaN
+    sc_off = {"x": (np.array(0.5, dtype=np.float32), np.array(0.2, dtype=np.float32))}
+    r_off = _run_sira(m_relu, {"x": (lo, hi)}, input_scales=sc_off)
+    assert np.isnan(r_off["y"][2]).all()
+    _assert_sound(m_relu, r_off, {"x": (lo, hi)}, input_scales=sc_off, n_samples=5)
+
+    # Clip with grid-aligned bounds
+    xc = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    yc = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    lo_c = _const("lo_c", np.array(-1.0, dtype=np.float32))
+    hi_c = _const("hi_c", np.array(1.5, dtype=np.float32))
+    m_clip = _make_model([xc], [yc], [ir.Node("", "Clip", [xc, lo_c, hi_c], outputs=[yc])], initializers=[lo_c, hi_c])
+    sc_clip = {"x": (np.array(0.5, dtype=np.float32), np.array(0.0, dtype=np.float32))}
+    r_clip = _run_sira(m_clip, {"x": (lo, hi)}, input_scales=sc_clip)
+    np.testing.assert_allclose(r_clip["y"][2], 0.5)
+    np.testing.assert_allclose(r_clip["y"][0], -2.0)
+    np.testing.assert_allclose(r_clip["y"][1], 3.0)
+    _assert_sound(m_clip, r_clip, {"x": (lo, hi)}, input_scales=sc_clip, n_samples=5)
+
+
+def test_maxpool_positive_vs_negative_scale():
+    x = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2, 4, 4]))
+    y = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2, 2, 2]))
+    mp = ir.Node("", "MaxPool", [x], attributes={"kernel_shape": ir.Attr("kernel_shape", ir.AttributeType.INTS, [2, 2]), "strides": ir.Attr("strides", ir.AttributeType.INTS, [2, 2])}, outputs=[y])
+    model = _make_model([x], [y], [mp])
+    lo = np.full((1, 2, 4, 4), -2.0, dtype=np.float32)
+    hi = np.full((1, 2, 4, 4), 3.0, dtype=np.float32)
+
+    # Per-channel positive scale -> scaled-int kept
+    sc_pos = {"x": (np.array([[[[0.25]], [[0.5]]]], dtype=np.float32), np.array([[[[0.1]], [[-0.2]]]], dtype=np.float32))}
+    r_pos = _run_sira(model, {"x": (lo, hi)}, input_scales=sc_pos)
+    np.testing.assert_allclose(r_pos["y"][2], sc_pos["x"][0])
+    np.testing.assert_allclose(r_pos["y"][3], sc_pos["x"][1])
+    _assert_sound(model, r_pos, {"x": (lo, hi)}, input_scales=sc_pos, n_samples=4)
+
+    # Negative scale -> falls back to NaN
+    sc_neg = {"x": (np.array([[[[0.25]], [[-0.5]]]], dtype=np.float32), np.array(0.0, dtype=np.float32))}
+    r_neg = _run_sira(model, {"x": (lo, hi)}, input_scales=sc_neg)
+    assert np.isnan(r_neg["y"][2]).all()
+    _assert_sound(model, r_neg, {"x": (lo, hi)}, input_scales=sc_neg, n_samples=4)
+
+
+def test_decomposed_inlined_quantizer_end_to_end():
+    # x -> Mul(1/s) -> Round -> Max(q_min) -> Min(q_max) -> MatMul(W_int)
+    s_val = np.float32(0.25)
+    inv_s = _const("inv_s", np.array(1.0 / s_val, dtype=np.float32))
+    q_lo = _const("q_lo", np.array(-8.0, dtype=np.float32))
+    q_hi = _const("q_hi", np.array(7.0, dtype=np.float32))
+    w_int = _const("w_int", np.array([[1.0, -2.0], [3.0, 1.0]], dtype=np.float32))
+
+    x = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    t1 = ir.Value(name="t1", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    t2 = ir.Value(name="t2", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    t3 = ir.Value(name="t3", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    t4 = ir.Value(name="t4", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    w_q = ir.Value(name="w_q", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([2, 2]))
+    y = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    nodes = [
+        ir.Node("", "Mul", [x, inv_s], outputs=[t1]),
+        ir.Node("", "Round", [t1], outputs=[t2]),
+        ir.Node("", "Max", [t2, q_lo], outputs=[t3]),
+        ir.Node("", "Min", [t3, q_hi], outputs=[t4]),
+        ir.Node("", "Round", [w_int], outputs=[w_q]),
+        ir.Node("", "MatMul", [t4, w_q], outputs=[y]),
+    ]
+    model = _make_model([x], [y], nodes, initializers=[inv_s, q_lo, q_hi, w_int])
+
+    lo = np.full((1, 2), -1.0, dtype=np.float32)
+    hi = np.full((1, 2), 2.5, dtype=np.float32)
+    r = _run_sira(model, {"x": (lo, hi)})
+    # MatMul input t4 must be plain integer (scale=1, bias=0)
+    np.testing.assert_allclose(r["t4"][2], 1.0)
+    np.testing.assert_allclose(r["t4"][3], 0.0)
+    # MatMul output y must be plain integer (scale=1, bias=0)
+    np.testing.assert_allclose(r["y"][2], 1.0)
+    np.testing.assert_allclose(r["y"][3], 0.0)
+    _assert_sound(model, r, {"x": (lo, hi)}, n_samples=6)
+
+    # Cross-check integer bounds of t4 against equivalent Quant node
+    qx_in = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    qs = _const("qs", np.array(s_val, dtype=np.float32))
+    qz = _const("qz", np.array(0.0, dtype=np.float32))
+    qbw = _const("qbw", np.array(4.0, dtype=np.float32))
+    qy = ir.Value(name="qy", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    qmodel = _make_model(
+        [qx_in], [qy],
+        [ir.Node(QONNX_DOMAIN, "Quant", [qx_in, qs, qz, qbw], attributes={"signed": ir.Attr("signed", ir.AttributeType.INT, 1), "narrow": ir.Attr("narrow", ir.AttributeType.INT, 0)}, outputs=[qy])],
+        initializers=[qs, qz, qbw], extra_opsets={QONNX_DOMAIN: 1},
+    )
+    rq = _run_sira(qmodel, {"x": (lo, hi)})
+    np.testing.assert_allclose(r["t4"][0], rq["qy"][0])
+    np.testing.assert_allclose(r["t4"][1], rq["qy"][1])
 
 
 
