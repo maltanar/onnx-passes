@@ -171,8 +171,11 @@ Two modes exist depending on whether $v$ has an underlying scaled-integer repres
 ## 6. Pooling and Padding Operators
 
 ### 6.1 `MaxPool` (`SiraMaxPool_v1`)
-- **Constraints**: Non-linear; never propagates scaled-integers (`scale = NaN, bias = NaN`).
-- **Operation**: $[\text{MaxPool}(x_{\text{rmin}}), \text{MaxPool}(x_{\text{rmax}}), \text{NaN}, \text{NaN}]$.
+- **Constraints for Scaled-Integer Propagation**: `x` is scaled-integer, and both `x_scale` and `x_bias` are spatially constant across `spatial_axes`.
+- **Operation**:
+  - **Scaled-Integer ($s_X \ge 0$)**: $[\text{MaxPool}(q_{X,\min}),\; \text{MaxPool}(q_{X,\max}),\; s_X,\; b_X]$.
+  - **Scaled-Integer ($s_X < 0$)**: $[-\text{MaxPool}(-q_{X,\max}),\; -\text{MaxPool}(-q_{X,\min}),\; s_X,\; b_X]$.
+  - **Fallback**: $[\text{MaxPool}(x_{\text{rmin}}), \text{MaxPool}(x_{\text{rmax}}), \text{NaN}, \text{NaN}]$.
 
 ### 6.2 `AveragePool` (`SiraAveragePool_v1`)
 - **Constraints for Scaled-Integer Propagation**: `x` is scaled-integer, `x_scale` is spatially constant, and window divisor $K = \prod \text{kernel\_shape}$ is constant ($\sum \text{pads} = 0$ or `count_include_pad == 1`).

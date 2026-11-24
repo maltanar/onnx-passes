@@ -424,6 +424,7 @@ class RangeAnalysis_v1(Transformation):
                     "dilations": ir.Attr("dilations", ir.AttributeType.INTS, _attr_ints(node, "dilations", [1] * srank)),
                     "ceil_mode": ir.Attr("ceil_mode", ir.AttributeType.INT, _attr_int(node, "ceil_mode", 0)),
                     "storage_order": ir.Attr("storage_order", ir.AttributeType.INT, _attr_int(node, "storage_order", 0)),
+                    "spatial_axes": ir.Attr("spatial_axes", ir.AttributeType.INTS, list(range(2, 2 + srank))),
                 }
                 mp_shape = out_val.shape
                 if mp_shape is None:

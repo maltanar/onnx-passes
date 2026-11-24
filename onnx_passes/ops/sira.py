@@ -1371,8 +1371,9 @@ class SiraMaxPool_v1(OnnxOperator, domain=DOMAIN, op_type="MaxPool", version=1):
     @staticmethod
     def script(op: Opset):
         sira = Opset(DOMAIN, 1)
+        use_v18 = op.version >= 18
 
-        def sira_maxpool(
+        def sira_maxpool_v18(
             x_min, x_max, x_scale, x_bias,
             ceil_mode: int = 0,
             dilations: INTS = [1, 1],
@@ -1380,9 +1381,11 @@ class SiraMaxPool_v1(OnnxOperator, domain=DOMAIN, op_type="MaxPool", version=1):
             pads: INTS = [0, 0, 0, 0],
             storage_order: int = 0,
             strides: INTS = [1, 1],
+            spatial_axes: INTS = [2, 3],
         ):
+            x_si = sira.IsScaledInt(x_scale, x_bias)
             x_rmin, x_rmax = sira.ToRealRange(x_min, x_max, x_scale, x_bias)
-            y_min = op.MaxPool(
+            r_min = op.MaxPool(
                 x_rmin,
                 ceil_mode=ceil_mode,
                 dilations=dilations,
@@ -1391,7 +1394,7 @@ class SiraMaxPool_v1(OnnxOperator, domain=DOMAIN, op_type="MaxPool", version=1):
                 storage_order=storage_order,
                 strides=strides,
             )
-            y_max = op.MaxPool(
+            r_max = op.MaxPool(
                 x_rmax,
                 ceil_mode=ceil_mode,
                 dilations=dilations,
@@ -1400,11 +1403,173 @@ class SiraMaxPool_v1(OnnxOperator, domain=DOMAIN, op_type="MaxPool", version=1):
                 storage_order=storage_order,
                 strides=strides,
             )
+
+            x_s_safe = op.Where(x_si, x_scale, op.CastLike(op.Constant(value_float=1.0), x_scale))
+            x_b_safe = op.Where(x_si, x_bias, op.CastLike(op.Constant(value_float=0.0), x_bias))
+
+            x_s_full = op.Add(op.Sub(x_min, x_min), op.CastLike(x_s_safe, x_min))
+            x_b_full = op.Add(op.Sub(x_min, x_min), op.CastLike(x_b_safe, x_min))
+            s_ax = op.Constant(value_ints=spatial_axes)
+
+            s_out = op.ReduceMin(x_s_full, s_ax, keepdims=1)
+            b_out = op.ReduceMin(x_b_full, s_ax, keepdims=1)
+            s_spatial_ok = sira.AllTrue(sira.IsEqual(s_out, op.ReduceMax(x_s_full, s_ax, keepdims=1)))
+            b_spatial_ok = sira.AllTrue(sira.IsEqual(b_out, op.ReduceMax(x_b_full, s_ax, keepdims=1)))
+            si_ok = op.And(x_si, op.And(s_spatial_ok, b_spatial_ok))
+
+            pos_s = op.GreaterOrEqual(s_out, op.CastLike(op.Constant(value_float=0.0), s_out))
+            q_min_pos = op.MaxPool(
+                x_min,
+                ceil_mode=ceil_mode,
+                dilations=dilations,
+                kernel_shape=kernel_shape,
+                pads=pads,
+                storage_order=storage_order,
+                strides=strides,
+            )
+            q_max_pos = op.MaxPool(
+                x_max,
+                ceil_mode=ceil_mode,
+                dilations=dilations,
+                kernel_shape=kernel_shape,
+                pads=pads,
+                storage_order=storage_order,
+                strides=strides,
+            )
+            q_min_neg = op.Neg(op.MaxPool(
+                op.Neg(x_max),
+                ceil_mode=ceil_mode,
+                dilations=dilations,
+                kernel_shape=kernel_shape,
+                pads=pads,
+                storage_order=storage_order,
+                strides=strides,
+            ))
+            q_max_neg = op.Neg(op.MaxPool(
+                op.Neg(x_min),
+                ceil_mode=ceil_mode,
+                dilations=dilations,
+                kernel_shape=kernel_shape,
+                pads=pads,
+                storage_order=storage_order,
+                strides=strides,
+            ))
+            q_min = op.Where(pos_s, q_min_pos, q_min_neg)
+            q_max = op.Where(pos_s, q_max_pos, q_max_neg)
+
             nan_s = op.Constant(value_float=float("nan"))
             nan_b = op.Constant(value_float=float("nan"))
-            return y_min, y_max, nan_s, nan_b
+            return (
+                op.Where(si_ok, q_min, r_min),
+                op.Where(si_ok, q_max, r_max),
+                op.Where(si_ok, s_out, nan_s),
+                op.Where(si_ok, b_out, nan_b),
+            )
 
-        return sira_maxpool
+        def sira_maxpool_v9(
+            x_min, x_max, x_scale, x_bias,
+            ceil_mode: int = 0,
+            dilations: INTS = [1, 1],
+            kernel_shape: INTS = [1, 1],
+            pads: INTS = [0, 0, 0, 0],
+            storage_order: int = 0,
+            strides: INTS = [1, 1],
+        ):
+            x_si = sira.IsScaledInt(x_scale, x_bias)
+            x_rmin, x_rmax = sira.ToRealRange(x_min, x_max, x_scale, x_bias)
+            r_min = op.MaxPool(
+                x_rmin,
+                ceil_mode=ceil_mode,
+                dilations=dilations,
+                kernel_shape=kernel_shape,
+                pads=pads,
+                storage_order=storage_order,
+                strides=strides,
+            )
+            r_max = op.MaxPool(
+                x_rmax,
+                ceil_mode=ceil_mode,
+                dilations=dilations,
+                kernel_shape=kernel_shape,
+                pads=pads,
+                storage_order=storage_order,
+                strides=strides,
+            )
+
+            x_s_safe = op.Where(x_si, x_scale, op.CastLike(op.Constant(value_float=1.0), x_scale))
+            x_b_safe = op.Where(x_si, x_bias, op.CastLike(op.Constant(value_float=0.0), x_bias))
+
+            x_s_full = op.Add(op.Sub(x_min, x_min), op.CastLike(x_s_safe, x_min))
+            x_b_full = op.Add(op.Sub(x_min, x_min), op.CastLike(x_b_safe, x_min))
+
+            nc_flat_shape = op.Concat(op.Shape(x_min, start=0, end=2), op.Constant(value_ints=[-1]), axis=0)
+            x_s_nc_flat = op.Reshape(x_s_full, nc_flat_shape)
+            x_b_nc_flat = op.Reshape(x_b_full, nc_flat_shape)
+            x_s_nc = op.ReduceMin(x_s_nc_flat, axes=[2], keepdims=0)
+            x_b_nc = op.ReduceMin(x_b_nc_flat, axes=[2], keepdims=0)
+
+            s_spatial_ok = sira.AllTrue(sira.IsEqual(op.ReduceMin(x_s_nc_flat, axes=[2], keepdims=1), op.ReduceMax(x_s_nc_flat, axes=[2], keepdims=1)))
+            b_spatial_ok = sira.AllTrue(sira.IsEqual(op.ReduceMin(x_b_nc_flat, axes=[2], keepdims=1), op.ReduceMax(x_b_nc_flat, axes=[2], keepdims=1)))
+            si_ok = op.And(x_si, op.And(s_spatial_ok, b_spatial_ok))
+
+            spatial_ones = op.Add(
+                op.Cast(op.Equal(op.Shape(x_min, start=2), op.Constant(value_int=-1)), to=ir.DataType.INT64),
+                op.Constant(value_int=1),
+            )
+            out_sb_shape = op.Concat(op.Shape(x_min, start=0, end=2), spatial_ones, axis=0)
+            s_out = op.Reshape(x_s_nc, out_sb_shape)
+            b_out = op.Reshape(x_b_nc, out_sb_shape)
+
+            pos_s = op.GreaterOrEqual(s_out, op.CastLike(op.Constant(value_float=0.0), s_out))
+            q_min_pos = op.MaxPool(
+                x_min,
+                ceil_mode=ceil_mode,
+                dilations=dilations,
+                kernel_shape=kernel_shape,
+                pads=pads,
+                storage_order=storage_order,
+                strides=strides,
+            )
+            q_max_pos = op.MaxPool(
+                x_max,
+                ceil_mode=ceil_mode,
+                dilations=dilations,
+                kernel_shape=kernel_shape,
+                pads=pads,
+                storage_order=storage_order,
+                strides=strides,
+            )
+            q_min_neg = op.Neg(op.MaxPool(
+                op.Neg(x_max),
+                ceil_mode=ceil_mode,
+                dilations=dilations,
+                kernel_shape=kernel_shape,
+                pads=pads,
+                storage_order=storage_order,
+                strides=strides,
+            ))
+            q_max_neg = op.Neg(op.MaxPool(
+                op.Neg(x_min),
+                ceil_mode=ceil_mode,
+                dilations=dilations,
+                kernel_shape=kernel_shape,
+                pads=pads,
+                storage_order=storage_order,
+                strides=strides,
+            ))
+            q_min = op.Where(pos_s, q_min_pos, q_min_neg)
+            q_max = op.Where(pos_s, q_max_pos, q_max_neg)
+
+            nan_s = op.Constant(value_float=float("nan"))
+            nan_b = op.Constant(value_float=float("nan"))
+            return (
+                op.Where(si_ok, q_min, r_min),
+                op.Where(si_ok, q_max, r_max),
+                op.Where(si_ok, s_out, nan_s),
+                op.Where(si_ok, b_out, nan_b),
+            )
+
+        return sira_maxpool_v18 if use_v18 else sira_maxpool_v9
 
 
 class SiraAveragePool_v1(OnnxOperator, domain=DOMAIN, op_type="AveragePool", version=1):

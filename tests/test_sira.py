@@ -618,7 +618,7 @@ def test_batchnorm_and_pooling_and_pad():
     ranges = _run_sira(model, {"x": (lo, hi)}, input_scales=sc)
     assert not np.isnan(ranges["bn_out"][2]).any()
     assert not np.isnan(ranges["ap_out"][2]).any()
-    assert np.isnan(ranges["mp_out"][2]).all()
+    assert not np.isnan(ranges["mp_out"][2]).any()
     assert np.isnan(ranges["y"][2]).all()
     _assert_sound(model, ranges, {"x": (lo, hi)}, input_scales=sc, n_samples=5)
 
