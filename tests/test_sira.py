@@ -1010,4 +1010,97 @@ def test_decomposed_inlined_quantizer_end_to_end():
     np.testing.assert_allclose(r["t4"][1], rq["qy"][1])
 
 
+def test_comparisons_where_and_inlined_bipolar():
+    for op_type in ("GreaterOrEqual", "Greater", "LessOrEqual", "Less", "Equal"):
+        a = ir.Value(name="a", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+        b = _const("b", np.array(0.0, dtype=np.float32))
+        y = ir.Value(name="y", type=ir.TensorType(ir.DataType.BOOL), shape=ir.Shape([1, 2]))
+        m = _make_model([a], [y], [ir.Node("", op_type, [a, b], outputs=[y])], initializers=[b])
+
+        # Undecided interval [-1, 1] vs 0 -> [0, 1], scale=1, bias=0
+        lo = np.full((1, 2), -1.0, dtype=np.float32)
+        hi = np.full((1, 2), 1.0, dtype=np.float32)
+        r = _run_sira(m, {"a": (lo, hi)})
+        np.testing.assert_allclose(r["y"][0], 0.0)
+        np.testing.assert_allclose(r["y"][1], 1.0)
+        np.testing.assert_allclose(r["y"][2], 1.0)
+        np.testing.assert_allclose(r["y"][3], 0.0)
+        _assert_sound(m, r, {"a": (lo, hi)}, n_samples=5)
+
+        # Decided positive interval [1, 2] vs 0
+        lo_p = np.full((1, 2), 1.0, dtype=np.float32)
+        hi_p = np.full((1, 2), 2.0, dtype=np.float32)
+        rp = _run_sira(m, {"a": (lo_p, hi_p)})
+        exp = 1.0 if op_type in ("GreaterOrEqual", "Greater") else 0.0
+        np.testing.assert_allclose(rp["y"][0], exp)
+        np.testing.assert_allclose(rp["y"][1], exp)
+
+    # End-to-end inlined BipolarQuant: Mul(Where(GreaterOrEqual(x, 0), +1, -1), s)
+    x = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    zero = _const("zero", np.array(0.0, dtype=np.float32))
+    pos1 = _const("pos1", np.array(1.0, dtype=np.float32))
+    neg1 = _const("neg1", np.array(-1.0, dtype=np.float32))
+    s_c = _const("s_c", np.array(0.25, dtype=np.float32))
+    cond = ir.Value(name="cond", type=ir.TensorType(ir.DataType.BOOL), shape=ir.Shape([1, 2]))
+    w_out = ir.Value(name="w_out", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    y = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    m_bp = _make_model(
+        [x], [y],
+        [
+            ir.Node("", "GreaterOrEqual", [x, zero], outputs=[cond]),
+            ir.Node("", "Where", [cond, pos1, neg1], outputs=[w_out]),
+            ir.Node("", "Mul", [w_out, s_c], outputs=[y]),
+        ],
+        initializers=[zero, pos1, neg1, s_c],
+    )
+    lo = np.full((1, 2), -2.0, dtype=np.float32)
+    hi = np.full((1, 2), 2.0, dtype=np.float32)
+    r_bp = _run_sira(m_bp, {"x": (lo, hi)})
+    np.testing.assert_allclose(r_bp["w_out"][0], -1.0)
+    np.testing.assert_allclose(r_bp["w_out"][1], 1.0)
+    np.testing.assert_allclose(r_bp["w_out"][2], 1.0)
+    np.testing.assert_allclose(r_bp["w_out"][3], 0.0)
+    np.testing.assert_allclose(r_bp["y"][0], -1.0)
+    np.testing.assert_allclose(r_bp["y"][1], 1.0)
+    np.testing.assert_allclose(r_bp["y"][2], 0.25)
+    np.testing.assert_allclose(r_bp["y"][3], 0.0)
+    _assert_sound(m_bp, r_bp, {"x": (lo, hi)}, n_samples=6)
+
+    # Decided Where passes chosen branch through; non-int constants fall back to NaN
+    r_dec = _run_sira(m_bp, {"x": (np.full((1, 2), 1.0, np.float32), np.full((1, 2), 2.0, np.float32))})
+    np.testing.assert_allclose(r_dec["y"][0], 0.25)
+    np.testing.assert_allclose(r_dec["y"][1], 0.25)
+
+
+def test_cast_and_castlike():
+    x = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    c1 = ir.Value(name="c1", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    t_untyped = ir.Value(name="t_untyped")
+    y = ir.Value(name="y", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1, 2]))
+    one_f = _const("one_f", np.array(1.0, dtype=np.float32))
+    m = _make_model(
+        [x, t_untyped], [y],
+        [
+            ir.Node("", "Cast", [x], attributes={"to": ir.Attr("to", ir.AttributeType.INT, 1)}, outputs=[c1]),
+            ir.Node("", "CastLike", [c1, t_untyped], outputs=[y]),
+        ],
+        initializers=[],
+    )
+    # Give t_untyped a float type on graph input only (CastLike ignores target dtype)
+    t_untyped.type = ir.TensorType(ir.DataType.FLOAT)
+    t_untyped.shape = ir.Shape([1, 2])
+    lo = np.full((1, 2), -2.0, dtype=np.float32)
+    hi = np.full((1, 2), 3.0, dtype=np.float32)
+    sc = {
+        "x": (np.array(0.5, dtype=np.float32), np.array(0.0, dtype=np.float32)),
+        "t_untyped": (np.array(1.0, dtype=np.float32), np.array(0.0, dtype=np.float32)),
+    }
+    r = _run_sira(m, {"x": (lo, hi), "t_untyped": (lo, hi)}, input_scales=sc)
+    np.testing.assert_allclose(r["c1"][2], 0.5)
+    np.testing.assert_allclose(r["y"][2], 0.5)
+    np.testing.assert_allclose(r["y"][0], -2.0)
+    np.testing.assert_allclose(r["y"][1], 3.0)
+    _assert_sound(m, r, {"x": (lo, hi), "t_untyped": (lo, hi)}, input_scales=sc, n_samples=4)
+
+
 

@@ -2194,13 +2194,191 @@ class SiraIdentity_v1(OnnxOperator, domain=DOMAIN, op_type="Identity", version=1
 
 
 class SiraCast_v1(OnnxOperator, domain=DOMAIN, op_type="Cast", version=1):
+    """SIRA range analysis handler for Cast."""
+
     @staticmethod
     def script(op: Opset):
+        sira = Opset(DOMAIN, 1)
+
         def sira_cast(x_min, x_max, x_scale, x_bias, to: int = 1):
-            y_min = op.Cast(x_min, to=to)
-            y_max = op.Cast(x_max, to=to)
-            nan_s = op.Constant(value_float=float("nan"))
-            nan_b = op.Constant(value_float=float("nan"))
-            return y_min, y_max, nan_s, nan_b
+            # Cast to floating-point preserves (min, max, scale, bias) unchanged;
+            # Cast to integer/bool truncates towards zero in float representation.
+            to_t = op.Constant(value_int=to)
+            is_flt = op.Or(
+                op.Or(op.Equal(to_t, op.Constant(value_int=1)), op.Equal(to_t, op.Constant(value_int=10))),
+                op.Or(op.Equal(to_t, op.Constant(value_int=11)), op.Equal(to_t, op.Constant(value_int=16))),
+            )
+            x_rmin, x_rmax = sira.ToRealRange(x_min, x_max, x_scale, x_bias)
+            i_min = op.Cast(op.Cast(x_rmin, to=to), to=ir.DataType.FLOAT)
+            i_max = op.Cast(op.Cast(x_rmax, to=to), to=ir.DataType.FLOAT)
+            one = op.Constant(value_float=1.0)
+            zero = op.Constant(value_float=0.0)
+            return (
+                op.Where(is_flt, x_min, i_min),
+                op.Where(is_flt, x_max, i_max),
+                op.Where(is_flt, x_scale, one),
+                op.Where(is_flt, x_bias, zero),
+            )
 
         return sira_cast
+
+
+class SiraCastLike_v1(OnnxOperator, domain=DOMAIN, op_type="CastLike", version=1):
+    """SIRA range analysis handler for CastLike (identity on range, ignoring target dtype)."""
+
+    @staticmethod
+    def script(op: Opset):
+        def sira_castlike(
+            x_min, x_max, x_scale, x_bias,
+            t_min, t_max, t_scale, t_bias,
+        ):
+            return x_min, x_max, x_scale, x_bias
+
+        return sira_castlike
+
+
+class SiraGreaterOrEqual_v1(OnnxOperator, domain=DOMAIN, op_type="GreaterOrEqual", version=1):
+    """SIRA range analysis handler for GreaterOrEqual."""
+
+    @staticmethod
+    def script(op: Opset):
+        sira = Opset(DOMAIN, 1)
+
+        def sira_ge(a_min, a_max, a_scale, a_bias, b_min, b_max, b_scale, b_bias):
+            a_rmin, a_rmax = sira.ToRealRange(a_min, a_max, a_scale, a_bias)
+            b_rmin, b_rmax = sira.ToRealRange(b_min, b_max, b_scale, b_bias)
+            always_true = op.GreaterOrEqual(a_rmin, b_rmax)
+            always_false = op.Less(a_rmax, b_rmin)
+            zero_b = op.Cast(op.And(always_true, op.Not(always_true)), to=ir.DataType.FLOAT)
+            one_b = op.Add(zero_b, op.Constant(value_float=1.0))
+            return op.Where(always_true, one_b, zero_b), op.Where(always_false, zero_b, one_b), op.Constant(value_float=1.0), op.Constant(value_float=0.0)
+
+        return sira_ge
+
+
+class SiraGreater_v1(OnnxOperator, domain=DOMAIN, op_type="Greater", version=1):
+    """SIRA range analysis handler for Greater."""
+
+    @staticmethod
+    def script(op: Opset):
+        sira = Opset(DOMAIN, 1)
+
+        def sira_gt(a_min, a_max, a_scale, a_bias, b_min, b_max, b_scale, b_bias):
+            a_rmin, a_rmax = sira.ToRealRange(a_min, a_max, a_scale, a_bias)
+            b_rmin, b_rmax = sira.ToRealRange(b_min, b_max, b_scale, b_bias)
+            always_true = op.Greater(a_rmin, b_rmax)
+            always_false = op.LessOrEqual(a_rmax, b_rmin)
+            zero_b = op.Cast(op.And(always_true, op.Not(always_true)), to=ir.DataType.FLOAT)
+            one_b = op.Add(zero_b, op.Constant(value_float=1.0))
+            return op.Where(always_true, one_b, zero_b), op.Where(always_false, zero_b, one_b), op.Constant(value_float=1.0), op.Constant(value_float=0.0)
+
+        return sira_gt
+
+
+class SiraLessOrEqual_v1(OnnxOperator, domain=DOMAIN, op_type="LessOrEqual", version=1):
+    """SIRA range analysis handler for LessOrEqual."""
+
+    @staticmethod
+    def script(op: Opset):
+        sira = Opset(DOMAIN, 1)
+
+        def sira_le(a_min, a_max, a_scale, a_bias, b_min, b_max, b_scale, b_bias):
+            a_rmin, a_rmax = sira.ToRealRange(a_min, a_max, a_scale, a_bias)
+            b_rmin, b_rmax = sira.ToRealRange(b_min, b_max, b_scale, b_bias)
+            always_true = op.LessOrEqual(a_rmax, b_rmin)
+            always_false = op.Greater(a_rmin, b_rmax)
+            zero_b = op.Cast(op.And(always_true, op.Not(always_true)), to=ir.DataType.FLOAT)
+            one_b = op.Add(zero_b, op.Constant(value_float=1.0))
+            return op.Where(always_true, one_b, zero_b), op.Where(always_false, zero_b, one_b), op.Constant(value_float=1.0), op.Constant(value_float=0.0)
+
+        return sira_le
+
+
+class SiraLess_v1(OnnxOperator, domain=DOMAIN, op_type="Less", version=1):
+    """SIRA range analysis handler for Less."""
+
+    @staticmethod
+    def script(op: Opset):
+        sira = Opset(DOMAIN, 1)
+
+        def sira_lt(a_min, a_max, a_scale, a_bias, b_min, b_max, b_scale, b_bias):
+            a_rmin, a_rmax = sira.ToRealRange(a_min, a_max, a_scale, a_bias)
+            b_rmin, b_rmax = sira.ToRealRange(b_min, b_max, b_scale, b_bias)
+            always_true = op.Less(a_rmax, b_rmin)
+            always_false = op.GreaterOrEqual(a_rmin, b_rmax)
+            zero_b = op.Cast(op.And(always_true, op.Not(always_true)), to=ir.DataType.FLOAT)
+            one_b = op.Add(zero_b, op.Constant(value_float=1.0))
+            return op.Where(always_true, one_b, zero_b), op.Where(always_false, zero_b, one_b), op.Constant(value_float=1.0), op.Constant(value_float=0.0)
+
+        return sira_lt
+
+
+class SiraEqual_v1(OnnxOperator, domain=DOMAIN, op_type="Equal", version=1):
+    """SIRA range analysis handler for Equal."""
+
+    @staticmethod
+    def script(op: Opset):
+        sira = Opset(DOMAIN, 1)
+
+        def sira_eq(a_min, a_max, a_scale, a_bias, b_min, b_max, b_scale, b_bias):
+            a_rmin, a_rmax = sira.ToRealRange(a_min, a_max, a_scale, a_bias)
+            b_rmin, b_rmax = sira.ToRealRange(b_min, b_max, b_scale, b_bias)
+            always_true = op.And(
+                op.And(sira.IsEqual(a_rmin, a_rmax), sira.IsEqual(b_rmin, b_rmax)),
+                sira.IsEqual(a_rmin, b_rmin),
+            )
+            always_false = op.Or(op.Less(a_rmax, b_rmin), op.Greater(a_rmin, b_rmax))
+            zero_b = op.Cast(op.And(always_true, op.Not(always_true)), to=ir.DataType.FLOAT)
+            one_b = op.Add(zero_b, op.Constant(value_float=1.0))
+            return op.Where(always_true, one_b, zero_b), op.Where(always_false, zero_b, one_b), op.Constant(value_float=1.0), op.Constant(value_float=0.0)
+
+        return sira_eq
+
+
+class SiraWhere_v1(OnnxOperator, domain=DOMAIN, op_type="Where", version=1):
+    """SIRA range analysis handler for Where."""
+
+    @staticmethod
+    def script(op: Opset):
+        sira = Opset(DOMAIN, 1)
+
+        def sira_where(
+            c_min, c_max, c_scale, c_bias,
+            a_min, a_max, a_scale, a_bias,
+            b_min, b_max, b_scale, b_bias,
+        ):
+            c_rmin, c_rmax = sira.ToRealRange(c_min, c_max, c_scale, c_bias)
+            a_rmin, a_rmax = sira.ToRealRange(a_min, a_max, a_scale, a_bias)
+            b_rmin, b_rmax = sira.ToRealRange(b_min, b_max, b_scale, b_bias)
+
+            zero_c = op.Sub(c_rmin, c_rmin)
+            r_min = op.Add(op.Min(a_rmin, b_rmin), zero_c)
+            r_max = op.Add(op.Max(a_rmax, b_rmax), zero_c)
+            zero_shape = op.Sub(r_min, r_min)
+
+            c_true = sira.AllTrue(op.Greater(c_rmin, op.CastLike(op.Constant(value_float=0.0), c_rmin)))
+            c_false = sira.AllTrue(op.LessOrEqual(c_rmax, op.CastLike(op.Constant(value_float=0.0), c_rmax)))
+
+            a_const = sira.IsConstant(a_rmin, a_rmax)
+            b_const = sira.IsConstant(b_rmin, b_rmax)
+            a_int = sira.AllTrue(sira.IsEqual(a_rmin, op.Round(a_rmin)))
+            b_int = sira.AllTrue(sira.IsEqual(b_rmin, op.Round(b_rmin)))
+            both_const_int = op.And(op.And(a_const, b_const), op.And(a_int, b_int))
+
+            one_s = op.Constant(value_float=1.0)
+            zero_b = op.Constant(value_float=0.0)
+            nan_s = op.Constant(value_float=float("nan"))
+            nan_b = op.Constant(value_float=float("nan"))
+
+            a_min_b = op.Add(a_min, zero_shape)
+            a_max_b = op.Add(a_max, zero_shape)
+            b_min_b = op.Add(b_min, zero_shape)
+            b_max_b = op.Add(b_max, zero_shape)
+
+            out_min = op.Where(c_true, a_min_b, op.Where(c_false, b_min_b, r_min))
+            out_max = op.Where(c_true, a_max_b, op.Where(c_false, b_max_b, r_max))
+            out_scale = op.Where(c_true, a_scale, op.Where(c_false, b_scale, op.Where(both_const_int, one_s, nan_s)))
+            out_bias = op.Where(c_true, a_bias, op.Where(c_false, b_bias, op.Where(both_const_int, zero_b, nan_b)))
+            return out_min, out_max, out_scale, out_bias
+
+        return sira_where

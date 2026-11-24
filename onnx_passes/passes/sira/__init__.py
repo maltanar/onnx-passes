@@ -16,14 +16,21 @@ _DIRECT_OPS = {
     "Add",
     "BatchNormalization",
     "BipolarQuant",
+    "Cast",
+    "CastLike",
     "Ceil",
     "Div",
+    "Equal",
     "Exp",
     "Flatten",
     "FloatQuant",
     "Floor",
     "Gather",
+    "Greater",
+    "GreaterOrEqual",
     "Identity",
+    "Less",
+    "LessOrEqual",
     "Log",
     "MatMul",
     "Mul",
@@ -41,6 +48,7 @@ _DIRECT_OPS = {
     "Tanh",
     "Transpose",
     "Trunc",
+    "Where",
 }
 
 
@@ -646,6 +654,10 @@ class RangeAnalysis_v1(Transformation):
                         "epsilon": ir.Attr("epsilon", ir.AttributeType.FLOAT, _attr_float(node, "epsilon", 1e-5)),
                         "momentum": ir.Attr("momentum", ir.AttributeType.FLOAT, _attr_float(node, "momentum", 0.9)),
                     }
+                elif op_type == "Cast":
+                    attrs = {"to": ir.Attr("to", ir.AttributeType.INT, _attr_int(node, "to", 1))}
+                elif op_type in {"CastLike", "GreaterOrEqual", "Greater", "LessOrEqual", "Less", "Equal", "Where"}:
+                    attrs = {}
                 elif op_type == "Shape":
                     attrs = {}
                     s0 = range_map[node.inputs[0]][0].shape
@@ -659,13 +671,21 @@ class RangeAnalysis_v1(Transformation):
                 inferred_shape = out_val.shape
                 if inferred_shape is None:
                     s0 = range_map[node.inputs[0]][0].shape
-                    if op_type in {"Quant", "BipolarQuant", "Trunc", "FloatQuant", "Relu", "BatchNormalization", "Ceil", "Floor", "Round", "Sign", "Log", "Exp", "Sqrt", "Sigmoid", "Tanh", "Abs", "Neg", "Identity", "Cast"}:
+                    if op_type in {"Quant", "BipolarQuant", "Trunc", "FloatQuant", "Relu", "BatchNormalization", "Ceil", "Floor", "Round", "Sign", "Log", "Exp", "Sqrt", "Sigmoid", "Tanh", "Abs", "Neg", "Identity", "Cast", "CastLike"}:
                         inferred_shape = s0
-                    elif op_type in {"Add", "Sub", "Mul", "Div", "Pow"}:
+                    elif op_type in {"Add", "Sub", "Mul", "Div", "Pow", "Equal", "Greater", "GreaterOrEqual", "Less", "LessOrEqual"}:
                         s1 = range_map[node.inputs[1]][0].shape
                         if s0 is not None and s1 is not None and s0.is_static() and s1.is_static():
                             try:
                                 inferred_shape = ir.Shape(np.broadcast_shapes(tuple(s0.dims), tuple(s1.dims)))
+                            except ValueError:
+                                inferred_shape = None
+                    elif op_type == "Where":
+                        s1 = range_map[node.inputs[1]][0].shape
+                        s2 = range_map[node.inputs[2]][0].shape
+                        if all(s is not None and s.is_static() for s in (s0, s1, s2)):
+                            try:
+                                inferred_shape = ir.Shape(np.broadcast_shapes(tuple(s0.dims), tuple(s1.dims), tuple(s2.dims)))
                             except ValueError:
                                 inferred_shape = None
                     elif op_type == "MatMul":
@@ -693,7 +713,13 @@ class RangeAnalysis_v1(Transformation):
                     elif op_type == "Gather" and out_val in const_shapes:
                         inferred_shape = ir.Shape(const_shapes[out_val].shape)
                 out_t = out_val.type
-                if out_t is None and out_val in const_shapes:
+                if op_type in {"GreaterOrEqual", "Greater", "LessOrEqual", "Less", "Equal", "Cast"}:
+                    out_t = ir.TensorType(ir.DataType.FLOAT)
+                elif op_type == "CastLike":
+                    out_t = range_map[node.inputs[0]][0].type or ir.TensorType(ir.DataType.FLOAT)
+                elif op_type == "Where":
+                    out_t = range_map[node.inputs[1]][0].type or ir.TensorType(ir.DataType.FLOAT)
+                elif out_t is None and out_val in const_shapes:
                     out_t = ir.TensorType(ir.DataType.INT64)
                 range_map[out_val] = emit_sira_node(
                     op_type,
@@ -719,7 +745,7 @@ class RangeAnalysis_v1(Transformation):
         new_outputs: list[ir.Value] = []
         for out in list(graph.outputs):
             o_min, o_max, o_scale, o_bias = range_map[out]
-            out_type = out.type or ir.TensorType(ir.DataType.FLOAT)
+            out_type = o_min.type or out.type or ir.TensorType(ir.DataType.FLOAT)
             out_shape = out.shape or ir.Shape([])
             o_min.type = o_min.type or out_type
             o_min.shape = o_min.shape or out_shape
