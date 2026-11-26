@@ -1,5 +1,5 @@
 from onnx_passes.passes.config import Config
-from onnx_passes.passes.base import Sequential, VerificationError
+from onnx_passes.passes.base import Sequential, VerificationError, list_passes
 
 from pathlib import Path
 from typing import Optional
@@ -21,11 +21,14 @@ rich.traceback.install(console=console)
 class OnnxPasses(Config, use_attribute_docstrings=True):
     """ONNX Passes: Model graph transformation and analysis."""
 
-    model: pydantic_settings.CliPositionalArg[Path]
+    model: pydantic_settings.CliPositionalArg[Optional[Path]] = None
     """Path to ONNX model file"""
 
     passes: pydantic_settings.CliPositionalArg[list[str]] = []
     """List of passes to apply: resolvable name or module"""
+
+    list_passes: pydantic_settings.CliToggleFlag[bool] = False
+    """List registered passes instead, positional arguments filter the list"""
 
     browse: pydantic_settings.CliToggleFlag[bool] = False
     """Browse the output model (or checkpoint after fail) in netron"""
@@ -76,7 +79,46 @@ class OnnxPasses(Config, use_attribute_docstrings=True):
             file_secret_settings
         )
 
+    def print_passes(self) -> None:
+        """Prints registered passes grouped by module with short descriptions."""
+        # In listing mode, all positional arguments act as filters
+        filters = [str(f) for f in (self.model, *self.passes) if f is not None]
+
+        if not (passes := list_passes(filters)):
+            console.print(f"No passes matching: {' '.join(filters)}")
+            return
+
+        from itertools import groupby
+        from rich.table import Table
+
+        prefix = "onnx_passes.passes."
+
+        for module, group in groupby(passes, key=lambda p: p[0]):
+            # Two-column grid per module keeps wrapped descriptions aligned
+            table = Table.grid(padding=(0, 2))
+            table.add_column(no_wrap=True)
+            table.add_column(style="dim")
+
+            for _, name, version, cls in group:
+                doc = (inspect.getdoc(cls) or "").partition("\n")[0]
+                table.add_row(f"  {name}_v{version}", doc)
+
+            console.print(f"\n[bold]{module.removeprefix(prefix)}[/bold]")
+            console.print(table, highlight=False)
+
+        console.print(f"\n{len(passes)} passes")
+
     def cli_cmd(self) -> None:
+        if self.list_passes:
+            return self.print_passes()
+
+        if self.model is None:
+            console.print(
+                "Missing model: onnx-passes MODEL [PASSES ...]"
+                " (or --list-passes [FILTER ...])"
+            )
+            raise SystemExit(2)
+
         # Set up a local pass sequence resolving passes from the list and
         # directly apply the sequence to the model loaded as ONNX IR
         class Passes_v0(Sequential):

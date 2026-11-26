@@ -330,6 +330,36 @@ def resolve_passes(identifier: Any):
     return passes
 
 
+def list_passes(filters: Iterable[str] = ()) -> list[tuple[str, str, int, type]]:
+    """Lists all registered passes as (module, name, version, class) tuples.
+
+    Passes register when their module is imported, so this first imports all
+    modules of the onnx_passes.passes package. Optional filters select passes
+    whose fully qualified identifier contains any of the filters (ignoring the
+    case).
+    """
+    import pkgutil
+    import onnx_passes.passes
+
+    for info in pkgutil.walk_packages(
+            onnx_passes.passes.__path__, f"{onnx_passes.passes.__name__}."
+    ):
+        import_module(info.name)
+
+    filters = [f.lower() for f in filters]
+
+    return sorted(
+        (module, name, version, cls)
+        for (module, name, version), cls in _registry.items()
+        # Exclude passes defined outside the package, e.g., ad-hoc sequences
+        if module.startswith(f"{onnx_passes.passes.__name__}.") and (
+            not filters or any(
+                f in f"{module}.{name}_v{version}".lower() for f in filters
+            )
+        )
+    )
+
+
 def resolve_module(identifier: str):
     """Resolves the module implementing a collection of passes."""
 
