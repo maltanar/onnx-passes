@@ -231,6 +231,47 @@ Changes:
   per-channel input scale past a depthwise Conv (`group == C_in`, any channel
   multiplier). It covers MobileNet's 12 depthwise Convs (15/13/0 -> 27/1/0).
 
+## Dead and constant channels
+
+Some zoo models have BatchNorm channels whose quantized weight is exactly 0.
+2W2A_rn8_pow2 has many: 25 of 64 in `layer1.0/bn1` and 21 in `layer1.0/bn2`.
+`MultiThreshold_10` (layer3 `downsample_bn`) has 242 of 256 channels with zero
+step weights. For such a channel the BatchNorm output is its bias, so the
+quantized activation is a constant independent of the input, mostly 0.
+
+Streamlining keeps these channels. They show up in three forms:
+
+- **Zero step weights in a `MultiThreshold`**, e.g., `[1, -0, -0, …]`. A scale
+  following the `MultiThreshold` is fused into its weights
+  (`FuseScaleIntoMultiThreshold_v1`), and zero scales give zero weights. The
+  thresholds of these channels are leftovers and do not matter.
+- **Zero input channels in the next Conv/MatMul weights.** `AbsorbMulIntoComparison`
+  handles zero scales by masking the comparison, which ends up as a 0/1 `Mul`
+  after the `MultiThreshold`. If a `Pad` sits in between, `MoveMulPastPad_v1`
+  can move the mask past the `Pad` before it gets fused, and the mask then
+  stops at the Conv. Since 2026-11-26 the sign rules
+  (`MoveSignedChannelMulPast{ConvInput,MatMulLhs}_v1`) accept zero channels and
+  fold the mask into zero weights. Example: all 25 dead channels of
+  `layer1.0/bn1` are zero input channels of `Conv_2`. Note that 2-bit weights
+  also produce zero input channels by themselves, so not every zero column is
+  a dead channel.
+- **A step of weight a at threshold −∞** for a channel with constant nonzero
+  output a, other steps at +∞ with weight 0.
+  `AbsorbChannelOffsetIntoMultiThreshold_v1` creates this form from a
+  zero-weight channel followed by a per-channel offset. Example: channel 35
+  of `MultiThreshold_0` (constant 1). This gives the `MultiThreshold`
+  per-step weights, e.g., shape (64,1,1,3) instead of (64,1,1,1).
+
+Implications:
+
+- Backends need to accept thresholds at ±∞ and per-step weights, or the
+  constant channels need a different encoding (e.g., the most negative
+  representable accumulator value instead of −∞).
+- The channels could be pruned: drop a dead channel from the `MultiThreshold`
+  and the matching input channel of the next layer, and fold a constant
+  nonzero output into that layer's bias. Residual `Add`s need care, since both
+  branches must agree on the channel set. Not implemented.
+
 ## Open follow-ups
 
 ### Per-channel sign flips in front of MaxPool (deferred 2026-11-26)
@@ -256,3 +297,41 @@ After this the scale is a uniform positive factor, which moves past `MaxPool`
 work out: multi-bit thresholds (the steps need mirroring, not just one
 comparison flipped), and what SIRA reports for an accumulator whose sign is
 flipped.
+
+Update (2026-11-26): the flip itself now exists as
+`AbsorbChannelOffsetIntoMultiThreshold_v1` (`multithreshold.fuse`). It handles
+multi-bit steps (`w [x ≥ t] = w + |w| [x < t]`) and compares against
+`nextafter(−t, +∞)`, which is exact for float accumulators too. It triggers on
+`Add(MultiThreshold, offset)` with non-positive weights where the offset
+cancels `sum(w)`, as in 2W2A_rn8_pow2. Still open: the CNV_1W1A form, a
+`Mul(±1)` after the bipolar `MultiThreshold`, has to be brought into that
+shape first, e.g., by fusing the sign into the step weights.
+
+### Redundant rounding in the Trunc tail (deferred 2026-11-26)
+
+2W2A_rn8_pow2 ends with `AveragePool → Reshape → Mul 64 → Round → Mul 4 →
+Floor → MatMul`. This is the inlined Brevitas `TruncAvgPool`: `Mul 16` from
+the export followed by `Trunc(scale 0.25, in_bw 6, out_bw 8, FLOOR)`.
+
+- `Mul 64` = 16 / 0.25 (scale to the input grid), `Round` snaps to that grid.
+- `Mul 4` = 2^(out_bw − in_bw): the exporter's out_bw is larger than in_bw,
+  so the "truncation" multiplies instead of dropping bits.
+- `Floor` is the truncation rounding.
+
+Both roundings are no-ops: `MultiThreshold_11` outputs multiples of 0.25, the
+4x4 average makes them multiples of 1/64, ×64 makes them integers and ×4 keeps
+them integers. The tail is ×256 on the pooled sum.
+
+Proposed fix: an `eliminate` rule removing `Round`/`Floor`/`Ceil` whose input
+is provably an integer multiple of a step q with q integer. Track q locally
+through producers:
+
+- `MultiThreshold`: gcd of the step weights (and offsets).
+- `AveragePool`: q / kernel area, if unpadded or `count_include_pad=1`.
+- `Mul` by a constant c: q·|c| (gcd over c's elements).
+- `Add`/`Sub`: gcd of both operands' steps. `Round`/`Floor`/`Ceil`: 1.
+- Shape ops, `Pad` (with a value on the grid), `MaxPool`: unchanged.
+
+The SIRA pass builds a separate analysis graph, so it is not usable as a
+cheap check inside a rewrite rule. Once the roundings are gone, the remaining
+`Mul`s fold into the MatMul output scale.

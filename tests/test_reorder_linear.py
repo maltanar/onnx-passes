@@ -121,6 +121,44 @@ def test_conv_signs_fold_into_integer_weights(group, bias):
     _assert_equivalent(proto, model, [1, c_in, 5, 5])
 
 
+@pytest.mark.parametrize("s", [
+    np.array([0.5, 0.0, 0.5, 0.0]),     # 0/1 mask times a common scale
+    np.array([0.5, 0.0, -0.5, 0.5]),    # Signs and zeros
+])
+def test_conv_masks_fold_into_integer_weights(s):
+    w = RNG.choice([-1.0, 1.0], (6, 4, 3, 3))
+    proto = _model(
+        [
+            oh.make_node("Mul", ["x", "s"], ["xs"]),
+            oh.make_node("Conv", ["xs", "w"], ["y"], pads=[1, 1, 1, 1]),
+        ],
+        [1, 4, 5, 5], [1, 6, 5, 5], {"s": s.reshape(1, 4, 1, 1), "w": w},
+    )
+
+    result, model = _apply(MoveSignedChannelMulPastConvInput_v1, proto)
+
+    assert result.modified
+    assert [n.op_type for n in model.graph][0] == "Conv"
+    weights = _weights(model, "Conv")
+    assert set(np.unique(weights)) <= {-1.0, 0.0, 1.0}
+    assert np.all(weights[:, s == 0] == 0)
+    _assert_equivalent(proto, model, [1, 4, 5, 5])
+
+
+def test_matmul_masks_fold_into_integer_weights():
+    s = np.array([2.0, 0.0, -2.0, 0.0])
+    proto = _model(
+        [oh.make_node("Mul", ["x", "s"], ["xs"]), oh.make_node("MatMul", ["xs", "w"], ["y"])],
+        [1, 4], [1, 3], {"s": s, "w": RNG.choice([-1.0, 1.0], (4, 3))},
+    )
+
+    result, model = _apply(MoveSignedChannelMulPastMatMulLhs_v1, proto)
+
+    assert result.modified
+    assert np.all(_weights(model, "MatMul")[s == 0] == 0)
+    _assert_equivalent(proto, model, [1, 4])
+
+
 def test_conv_rule_rejects_scale_varying_spatially():
     s = np.full((1, 2, 3, 3), 2.0)
     s[0, 0, 0, 0] = -2.0

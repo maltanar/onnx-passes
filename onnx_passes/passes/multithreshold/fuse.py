@@ -1,5 +1,7 @@
-from onnx_passes.passes.base import RewriteRule, Sequential
+from onnx_passes.passes.base import RewriteRule, Sequential, Transformation
 from onnx_passes.passes.verify import Verify, tolerance
+
+from onnxscript import GraphBuilder
 
 from onnx_passes.ops import DOMAIN as PASSES_DOMAIN
 
@@ -327,6 +329,255 @@ class FuseAddIntoMultiThreshold_v1(RewriteRule, Verify):
         )
 
 
+def _channel_matrix(value: np.ndarray, rank: int) -> np.ndarray | None:
+    """MultiThreshold parameter (thresholds or weights) as (channels, steps).
+
+    The parameters broadcast against the input of the given rank expanded by
+    the trailing step axis. Returns None if the parameter varies along any axis
+    but the channel axis (1) and the step axis.
+    """
+    if value.ndim > rank + 1:
+        return None
+
+    value = np.reshape(value, (*(1,) * (rank + 1 - value.ndim), *value.shape))
+    index = tuple(
+        slice(None) if axis in {1, rank} else slice(0, 1)
+        for axis in range(rank + 1)
+    )
+
+    if not np.all(value == value[index]):
+        return None
+
+    return np.reshape(value[index], (value.shape[1], value.shape[-1]))
+
+
+def _channel_vector(value: np.ndarray, rank: int) -> np.ndarray | None:
+    """Constant broadcast against a tensor of the given rank as a vector along
+    the channel axis (1), None if it varies along any other axis or expands."""
+    if value.ndim > rank:
+        return None
+
+    value = np.reshape(value, (*(1,) * (rank - value.ndim), *value.shape))
+    index = tuple(
+        slice(None) if axis == 1 else slice(0, 1) for axis in range(rank)
+    )
+
+    if not np.all(value == value[index]):
+        return None
+
+    return np.reshape(value[index], (-1,))
+
+
+def _negatable_producer(x: ir.Value) -> ir.Node | None:
+    """Conv or MatMul with constant weights (and bias) producing x, if x is not
+    used elsewhere, such that output channels can be negated in the weights."""
+    if len(x.uses()) != 1 or x.is_graph_output():
+        return None
+
+    if (node := x.producer()) is None or node.domain not in {"", "ai.onnx"}:
+        return None
+
+    if node.op_type == "Conv":
+        if ir.convenience.get_const_tensor(node.inputs[1]) is None:
+            return None
+        if len(node.inputs) > 2 and node.inputs[2] is not None:
+            if ir.convenience.get_const_tensor(node.inputs[2]) is None:
+                return None
+        return node
+
+    if node.op_type == "MatMul":
+        if (weights := ir.convenience.get_const_tensor(node.inputs[1])) is None:
+            return None
+        if weights.numpy().ndim != 2 or x.shape is None or len(x.shape) != 2:
+            return None
+        return node
+
+    return None
+
+
+def _constant_like(op, value: np.ndarray, like: ir.Value) -> ir.Value:
+    """Constant from value, propagating a constant folding stop of like."""
+    const = op.Constant(value=ir.tensor(np.ascontiguousarray(value)))
+
+    if like.meta.get("constant_stop"):
+        const.meta["constant_stop"] = True
+
+    return const
+
+
+class AbsorbChannelOffsetIntoMultiThreshold_v1(Transformation, Verify):
+    """Absorb per-channel constant offsets following MultiThreshold.
+
+    Normalizing a quantized activation with per-channel scales of different
+    signs or zero scales yields MultiThreshold channels with negative or zero
+    step weights, followed by a per-channel constant offset restoring the
+    output range. Per-channel offsets cannot move past padding and Conv, so
+    absorb them into the MultiThreshold for these channels:
+
+    1. Zero weights, i.e., constant channels: y = a for a > 0 is a single step
+       of weight a at threshold -inf, all other steps are dead (+inf).
+    2. Non-positive weights with a + sum(w) = 0: As w [x >= t] = w + |w| [x < t]
+       and x < t <=> -x >= nextafter(-t, +inf), exact in floating-point, the
+       channel counts up on the negated input. The negation is folded into the
+       output channel of the Conv or MatMul producing x if x is used only here.
+
+    The MultiThreshold might have other consumers, which receive the original
+    output by subtracting the absorbed offsets, to be absorbed downstream.
+    """
+
+    def call(self, model: ir.Model) -> ir.passes.PassResult:
+        builder = GraphBuilder(model.graph)
+        op = builder.op
+
+        modified = False
+
+        for node in list(model.graph):
+            if node.op_type != "Add" or node.domain not in {"", "ai.onnx"}:
+                continue
+
+            for i in (0, 1):
+                if self._absorb(op, node, node.inputs[i], node.inputs[1 - i]):
+                    modified = True
+                    break
+
+        return ir.passes.PassResult(model, modified)
+
+    @staticmethod
+    def _absorb(op, add: ir.Node, y: ir.Value, c: ir.Value) -> bool:
+        mt = y.producer()
+
+        if mt is None or mt.op_type != "MultiThreshold":
+            return False
+
+        if mt.domain != PASSES_DOMAIN or len(mt.inputs) != 3:
+            return False
+
+        x, thresholds, weights = mt.inputs
+
+        if x.shape is None or (rank := len(x.shape)) < 2:
+            return False
+
+        if x.dtype is None or not x.dtype.is_floating_point():
+            return False
+
+        if (offset := ir.convenience.get_const_tensor(c)) is None:
+            return False
+
+        if (t := ir.convenience.get_const_tensor(thresholds)) is None:
+            return False
+
+        if (w := ir.convenience.get_const_tensor(weights)) is None:
+            return False
+
+        offset = _channel_vector(offset.numpy(), rank)
+        t = _channel_matrix(t.numpy(), rank)
+        w = _channel_matrix(w.numpy(), rank)
+
+        if offset is None or t is None or w is None:
+            return False
+
+        # Bring all parameters to (channels, steps), the offset to channels
+        channels = max(len(offset), t.shape[0], w.shape[0])
+        steps = max(t.shape[1], w.shape[1])
+
+        if x.shape[1] != channels and channels != 1:
+            return False
+
+        try:
+            t = np.broadcast_to(t, (channels, steps)).copy()
+            w = np.broadcast_to(w, (channels, steps)).copy()
+            offset = np.broadcast_to(offset, (channels,))
+        except ValueError:
+            return False
+
+        if not (np.all(np.isfinite(offset)) and np.all(np.isfinite(w))):
+            return False
+
+        dead = np.all(w == 0, axis=-1) & (offset > 0)
+        flip = (
+            np.any(w != 0, axis=-1) & np.all(w <= 0, axis=-1)
+            & (offset + np.sum(w, axis=-1) == 0) & (offset != 0)
+        )
+
+        producer = _negatable_producer(x)
+
+        if producer is None or channels != x.shape[1]:
+            flip[:] = False
+
+        if not (np.any(dead) or np.any(flip)):
+            return False
+
+        absorbed = np.where(dead | flip, offset, 0).astype(offset.dtype)
+
+        # 1. Constant channels: A single step of weight a at -inf
+        t[dead] = np.inf
+        w[dead] = 0
+        t[dead, 0] = -np.inf
+        w[dead, 0] = offset[dead]
+
+        # 2. Channels counting down on x count up on -x
+        t[flip] = np.nextafter(-t[flip], np.asarray(np.inf, t.dtype))
+        w[flip] = -w[flip]
+
+        if np.any(flip):
+            x = AbsorbChannelOffsetIntoMultiThreshold_v1._negate(
+                op, producer, np.where(flip, -1, 1)
+            )
+
+        shape = (channels, *(1,) * (rank - 2), steps)
+        absorbed = np.reshape(absorbed, (channels, *(1,) * (rank - 2)))
+        residual = np.reshape(offset, absorbed.shape) - absorbed
+
+        out = op.MultiThreshold(
+            x,
+            op.Constant(value=ir.tensor(np.reshape(t, shape))),
+            op.Constant(value=ir.tensor(np.reshape(w, shape))),
+            _domain=PASSES_DOMAIN
+        )
+
+        # Other consumers of the MultiThreshold see the original output
+        if len(y.uses()) > 1 or y.is_graph_output():
+            ir.convenience.replace_all_uses_with(
+                y, op.Sub(out, op.Constant(value=ir.tensor(absorbed))),
+                replace_graph_outputs=True
+            )
+
+        if np.any(residual != 0):
+            out = op.Add(out, op.Constant(value=ir.tensor(residual)))
+
+        ir.convenience.replace_all_uses_with(
+            add.outputs[0], out, replace_graph_outputs=True
+        )
+
+        return True
+
+    @staticmethod
+    def _negate(op, node: ir.Node, signs: np.ndarray) -> ir.Value:
+        """Replacement for the Conv or MatMul node with output channels
+        multiplied by the signs in {-1, +1}."""
+        w = node.inputs[1]
+        weights = ir.convenience.get_const_tensor(w).numpy()
+
+        if node.op_type == "MatMul":
+            signs = signs.astype(weights.dtype)
+            return op.MatMul(
+                node.inputs[0], _constant_like(op, weights * signs, w)
+            )
+
+        signs = signs.astype(weights.dtype)
+        inputs = [
+            node.inputs[0], _constant_like(
+                op, weights * np.reshape(signs, (-1, *(1,) * (weights.ndim - 1))), w
+            )
+        ]
+
+        if len(node.inputs) > 2 and (b := node.inputs[2]) is not None:
+            bias = ir.convenience.get_const_tensor(b).numpy()
+            inputs.append(_constant_like(op, bias * signs, b))
+
+        return op.Conv(*inputs, **node.attributes)
+
+
 from onnx_passes.passes import fold_constants
 from onnx_passes.passes import multithreshold
 
@@ -339,6 +590,7 @@ class FuseMultiThresholdLoop_v1(Sequential):
         FuseAddedMultiThresholds_v1,
         FuseConsecutiveMultiThresholds_v1,
         FuseAddIntoMultiThreshold_v1,
+        AbsorbChannelOffsetIntoMultiThreshold_v1,
         fold_constants,
         multithreshold.normalize,
     ]

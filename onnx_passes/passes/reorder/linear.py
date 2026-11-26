@@ -486,19 +486,27 @@ def _uniform_magnitude_signs(
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Splits s varying only along axis into signs and a common magnitude.
 
-    Returns (signs along the axis, scalar magnitude) if s only varies along the
-    axis, all magnitudes are identical and nonzero and s is not effectively
-    scalar (covered by the scalar rules), None otherwise.
+    Returns (signs along the axis, scalar magnitude) with signs in {-1, 0, +1}
+    if s only varies along the axis, all nonzero magnitudes are identical and s
+    is not effectively scalar (covered by the scalar rules), None otherwise.
+    Zero channels, e.g., masks of channels pruned by a zero BatchNorm scale,
+    have sign 0 and fold to zero weights, keeping integer weights in range.
     """
     if _is_scalar(value) or (vector := _vector_along(value, axis)) is None:
         return None
 
     magnitude = np.abs(vector)
 
-    if magnitude[0] == 0 or not np.all(magnitude == magnitude[0]):
+    if not np.all(np.isfinite(magnitude)):
         return None
 
-    return np.sign(vector), magnitude[0]
+    if (nonzero := magnitude[magnitude != 0]).size == 0:
+        return None
+
+    if not np.all(nonzero == nonzero[0]):
+        return None
+
+    return np.sign(vector), nonzero[0]
 
 
 def _constant_like(value: np.ndarray, like: ir.Value, op) -> ir.Value:
@@ -517,9 +525,11 @@ class MoveSignedChannelMulPastMatMulLhs_v1(RewriteRule, Verify):
 
     MatMul(s * x, w) = MatMul(x, sign(s) * w) * |s| for constant weights w if s
     only varies along the reduction axis, i.e., the last axis of x, and all
-    channels share the same magnitude |s|. The signs are folded into the rows of
-    the weights, which keeps integer weights integer, e.g., the per-channel
-    +-(2x - 1) following bipolar MultiThresholds with sign-flipped channels.
+    nonzero channels share the same magnitude |s|. The signs are folded into
+    the rows of the weights, which keeps integer weights integer, e.g., the
+    per-channel +-(2x - 1) following bipolar MultiThresholds with sign-flipped
+    channels.
+    Zero channels, e.g., masks of pruned channels, fold to zero rows.
     """
 
     @property
@@ -563,10 +573,11 @@ class MoveSignedChannelMulPastConvInput_v1(RewriteRule, Verify):
     """Reorder per-channel sign-scale multiplication of the input past Conv.
 
     Conv(s * x, w) = Conv(x, sign(s) * w) * |s| for constant weights w if s only
-    varies along the channel axis of x and all channels share the same magnitude
-    |s|. The signs are folded into the input channels of the weights (respecting
-    groups), which keeps integer weights integer. Zero padding is invariant to
-    scaling. A bias is split off as an explicit Add.
+    varies along the channel axis of x and all nonzero channels share the same
+    magnitude |s|. The signs are folded into the input channels of the weights
+    (respecting groups), which keeps integer weights integer. Zero channels,
+    e.g., masks of pruned channels, fold to zero weights. Zero padding is
+    invariant to scaling. A bias is split off as an explicit Add.
     """
 
     @property
