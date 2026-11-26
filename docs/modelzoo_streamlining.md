@@ -230,3 +230,29 @@ Changes:
 - **`MoveChannelMulPastDepthwiseConvInput_v1`** (`reorder/linear.py`): moves a
   per-channel input scale past a depthwise Conv (`group == C_in`, any channel
   multiplier). It covers MobileNet's 12 depthwise Convs (15/13/0 -> 27/1/0).
+
+## Open follow-ups
+
+### Per-channel sign flips in front of MaxPool (deferred 2026-11-26)
+
+In CNV_1W1A, a per-channel `Mul(±1)` stays between each `MultiThreshold` and
+the following `MaxPool`. The sign flips come from batch-norm channels with
+negative scale, which invert the threshold comparison. A negative scale turns
+the maximum into a minimum, so it cannot move past `MaxPool`, and ONNX has no
+MinPool. Everything else (the common magnitude, the offsets) already moves past
+`MaxPool` and the next `Conv`.
+
+Proposed fix: push the sign upstream instead of downstream. For a channel with
+negative sign and `y = [x ≥ t]` (bipolar output `2y − 1`):
+
+- `−(2y − 1) = 2(1 − y) − 1`, and `1 − y = [x < t] = [−x > −t]`.
+- `x` is an integer accumulator, so `[−x > −t] = [−x ≥ ⌊−t⌋ + 1]`, which is
+  again a regular `MultiThreshold` on `−x`.
+- `−x` comes from negating that output channel of the preceding `Conv`/`MatMul`
+  weights, and ±1 weights stay ±1.
+
+After this the scale is a uniform positive factor, which moves past `MaxPool`
+(`MoveMulPastMaxPool_v1`) and the next `Conv` like the other cases. Still to
+work out: multi-bit thresholds (the steps need mirroring, not just one
+comparison flipped), and what SIRA reports for an accumulator whose sign is
+flipped.

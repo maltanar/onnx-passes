@@ -196,13 +196,66 @@ class MoveScalarMulPastConvInput_v1(RewriteRule, Verify):
         return y
 
 
+def _pad_inputs(node: ir.Node) -> tuple[ir.Value | None, ir.Value | None]:
+    """Optional constant_value and axes inputs of a Pad node."""
+    inputs = [*node.inputs[2:4], None, None]
+    return inputs[0], inputs[1]
+
+
+def _padded_axes(rank: int, pads: ir.Value, axes: ir.Value | None):
+    """Axes actually padded, None if pads or axes are not constant."""
+    if (pads := ir.convenience.get_const_tensor(pads)) is None:
+        return None
+
+    if axes is not None:
+        if (axes := ir.convenience.get_const_tensor(axes)) is None:
+            return None
+        axes = [int(a) % rank for a in axes.numpy().reshape(-1)]
+    else:
+        axes = list(range(rank))
+
+    pads = pads.numpy().reshape(2, -1)
+    return [a for a, b, e in zip(axes, *pads) if b != 0 or e != 0]
+
+
+def _pad_value(const_value: ir.Value | None) -> np.ndarray | None:
+    """Constant padding value (zero if absent), None if not constant."""
+    if const_value is None:
+        return np.zeros(())
+    if (value := ir.convenience.get_const_tensor(const_value)) is None:
+        return None
+    return value.numpy()
+
+
+def _reduce_padded(value: np.ndarray, padded: list[int]) -> np.ndarray:
+    """Reduce the padded axes to singletons to broadcast over padded output."""
+    return value[tuple(
+        slice(0, 1) if a in padded else slice(None) for a in range(value.ndim)
+    )]
+
+
+def _pad_mode(node: ir.Node) -> str:
+    """Padding mode of a Pad node, defaults to constant padding."""
+    mode = node.attributes.get("mode")
+    return mode.as_string() if mode is not None else "constant"
+
+
+def _pad(op, x, pads, const_value, axes):
+    """Constant Pad of x, passing optional inputs only as far as present."""
+    inputs = [x, pads, const_value, axes]
+    while inputs[-1] is None:
+        inputs.pop()
+    return op.Pad(*inputs, mode="constant")
+
+
 @tolerance
 class MoveMulPastPad_v1(RewriteRule, Verify):
     """Reorder multiplication to follow constant padding.
 
     Pad(s * x, c) = Pad(x, c / s) * s for scalar nonzero s. For zero padding,
     i.e., c = 0, the padding value is invariant to any s which is constant along
-    the padded axes, e.g., per-channel scales.
+    the padded axes, e.g., per-channel scales. The same holds for infinite
+    padding, e.g., explicit MaxPool padding, and positive s.
     """
 
     @property
@@ -210,56 +263,46 @@ class MoveMulPastPad_v1(RewriteRule, Verify):
         return True
 
     @staticmethod
-    def pattern_v18(op, x, s, pads, const_value, axes, mode):
-        return op.Pad(op.Mul(s, x), pads, const_value, axes, mode=mode)
+    def pattern_v18(op, x, s, pads):
+        # Optional constant_value and axes as well as the mode attribute are
+        # taken from the node: Pattern variables do not match absent inputs
+        return op.Pad(
+            op.Mul(s, x), pads, _allow_other_inputs=True, _outputs=["out"]
+        )
 
     @staticmethod
-    def check_v18(context, x, s, pads, const_value, axes, mode):
-        if mode.as_string() != "constant":
+    def check_v18(context, x, s, pads, out):
+        if _pad_mode(out.producer()) != "constant":
             return False
 
         if (value := _broadcast_to_operand(s, x)) is None:
             return False
 
-        if (pads := ir.convenience.get_const_tensor(pads)) is None:
+        const_value, axes = _pad_inputs(out.producer())
+
+        if (const_value := _pad_value(const_value)) is None:
             return False
 
-        if const_value is not None:
-            if (const_value := ir.convenience.get_const_tensor(const_value)) is None:
-                return False
-            const_value = const_value.numpy()
-        else:
-            const_value = np.zeros(())
-
-        if axes is not None:
-            if (axes := ir.convenience.get_const_tensor(axes)) is None:
-                return False
-            axes = [int(a) % value.ndim for a in axes.numpy().reshape(-1)]
-        else:
-            axes = list(range(value.ndim))
+        if (padded := _padded_axes(value.ndim, pads, axes)) is None:
+            return False
 
         # Scalar scales: the padding value can be rescaled unless zero scale
         if _is_scalar(value):
-            return np.all(const_value == 0) or np.all(value != 0)
+            return bool(np.all(const_value == 0) or np.all(value != 0))
 
-        # Non-scalar scales: Only for zero padding and scales constant along
-        # all actually padded axes
+        # Non-scalar scales: Only for zero padding, or infinite padding (e.g.,
+        # explicit MaxPool padding) with positive scales, and scales constant
+        # along all actually padded axes
         if not np.all(const_value == 0):
-            return False
+            if not (np.all(np.isinf(const_value)) and np.all(value > 0)):
+                return False
 
-        pads = pads.numpy().reshape(2, -1)
-        padded = [a for a, b, e in zip(axes, *pads) if b != 0 or e != 0]
-
-        index = tuple(
-            slice(0, 1) if a in padded else slice(None)
-            for a in range(value.ndim)
-        )
-
-        return bool(np.all(value == value[index]))
+        return bool(np.all(value == _reduce_padded(value, padded)))
 
     @staticmethod
-    def rewrite_v18(op, x, s, pads, const_value, axes, mode):
+    def rewrite_v18(op, x, s, pads, out):
         value = _broadcast_to_operand(s, x)
+        const_value, axes = _pad_inputs(out.producer())
 
         if _is_scalar(value):
             scale = np.reshape(value, (-1,))[0]
@@ -269,30 +312,85 @@ class MoveMulPastPad_v1(RewriteRule, Verify):
                     op.CastLike(op.Constant(value=ir.tensor(scale)), const_value)
                 )
             return op.Mul(
-                op.Pad(x, pads, const_value, axes, mode=mode),
+                _pad(op, x, pads, const_value, axes),
                 op.Constant(value=ir.tensor(scale))
             )
 
-        # Constant along all padded axes: Reduce these to singleton axes to
-        # broadcast over the padded output
-        pads_ = ir.convenience.get_const_tensor(pads).numpy().reshape(2, -1)
-
-        if axes is not None:
-            axes_ = ir.convenience.get_const_tensor(axes).numpy().reshape(-1)
-            axes_ = [int(a) % value.ndim for a in axes_]
-        else:
-            axes_ = list(range(value.ndim))
-
-        padded = [a for a, b, e in zip(axes_, *pads_) if b != 0 or e != 0]
-
-        scale = value[tuple(
-            slice(0, 1) if a in padded else slice(None)
-            for a in range(value.ndim)
-        )]
+        padded = _padded_axes(value.ndim, pads, axes)
+        scale = _reduce_padded(value, padded)
 
         return op.Mul(
-            op.Pad(x, pads, const_value, axes, mode=mode),
+            _pad(op, x, pads, const_value, axes),
             op.Constant(value=ir.tensor(np.ascontiguousarray(scale)))
+        )
+
+
+@tolerance
+class MoveAddPastPad_v1(RewriteRule, Verify):
+    """Reorder addition to follow constant padding.
+
+    Pad(x + c, v) = Pad(x, v - c) + c if c is constant along the padded axes.
+    As the padding value must remain a scalar, c must be a scalar or the
+    padding infinite, e.g., explicit MaxPool padding, where v - c = v.
+    """
+
+    @property
+    def commute(self) -> bool:
+        return True
+
+    @staticmethod
+    def pattern_v18(op, x, c, pads):
+        # Optional constant_value and axes as well as the mode attribute are
+        # taken from the node: Pattern variables do not match absent inputs
+        return op.Pad(
+            op.Add(x, c), pads, _allow_other_inputs=True, _outputs=["out"]
+        )
+
+    @staticmethod
+    def check_v18(context, x, c, pads, out):
+        if _pad_mode(out.producer()) != "constant":
+            return False
+
+        if (value := _broadcast_to_operand(c, x)) is None:
+            return False
+
+        if not np.all(np.isfinite(value)):
+            return False
+
+        const_value, axes = _pad_inputs(out.producer())
+
+        if (const_value := _pad_value(const_value)) is None:
+            return False
+
+        if (padded := _padded_axes(value.ndim, pads, axes)) is None:
+            return False
+
+        if not (_is_scalar(value) or np.all(np.isinf(const_value))):
+            return False
+
+        return bool(np.all(value == _reduce_padded(value, padded)))
+
+    @staticmethod
+    def rewrite_v18(op, x, c, pads, out):
+        value = _broadcast_to_operand(c, x)
+        const_value, axes = _pad_inputs(out.producer())
+        padded = _padded_axes(value.ndim, pads, axes)
+
+        # Shift the padding value for scalar c (infinite values stay infinite),
+        # per-channel c is only accepted for infinite padding values
+        if _is_scalar(value):
+            offset = np.reshape(value, (-1,))[0]
+            const_value = op.Sub(
+                const_value if const_value is not None
+                else op.CastLike(op.Constant(value_float=0.0), x),
+                op.CastLike(op.Constant(value=ir.tensor(offset)), x)
+            )
+
+        offset = _reduce_padded(value, padded)
+
+        return op.Add(
+            _pad(op, x, pads, const_value, axes),
+            op.Constant(value=ir.tensor(np.ascontiguousarray(offset)))
         )
 
 
