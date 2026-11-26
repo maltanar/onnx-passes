@@ -1,4 +1,4 @@
-"""Tests for folding per-channel sign scales into MatMul and Conv weights."""
+"""Tests for reordering elementwise operations past MatMul and Conv."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import pytest
 from onnx.reference import ReferenceEvaluator
 
 from onnx_passes.passes.reorder.linear import (
+    MoveAddPastConvInput_v1,
     MoveSignedChannelMulPastConvInput_v1,
     MoveSignedChannelMulPastMatMulLhs_v1,
 )
@@ -128,3 +129,47 @@ def test_conv_rule_rejects_scale_varying_spatially():
         [1, 2, 3, 3], [1, 4, 1, 1], {"s": s, "w": RNG.choice([-1.0, 1.0], (4, 2, 3, 3))},
     )
     assert not _apply(MoveSignedChannelMulPastConvInput_v1, proto)[0].modified
+
+
+@pytest.mark.parametrize("c_shape,group,bias,attrs", [
+    ([], 1, False, {}),                                  # Scalar offset
+    ([1, 4, 1, 1], 1, True, {}),                         # Per-channel, bias
+    ([4, 1, 1], 2, True, {"strides": [2, 2]}),           # Grouped, strided
+    ([1, 4, 1, 1], 4, False, {"dilations": [2, 2]}),     # Depthwise, dilated
+    ([1, 4, 1, 1], 1, False, {"pads": [0, 0, 0, 0]}),    # Explicit zero pads
+])
+def test_add_moves_past_unpadded_conv(c_shape, group, bias, attrs):
+    c_in, c_out = 4, 8
+    c = RNG.choice([-128.0, -1.0, 1.0], c_shape if c_shape else ())
+    w = RNG.choice([-1.0, 1.0], (c_out, c_in // group, 3, 3))
+    inits = {"c": np.asarray(c), "w": w}
+    inputs = ["xc", "w"]
+    if bias:
+        inits["b"] = RNG.normal(size=c_out)
+        inputs.append("b")
+    proto = _model(
+        [
+            oh.make_node("Add", ["x", "c"], ["xc"]),
+            oh.make_node("Conv", inputs, ["y"], group=group, **attrs),
+        ],
+        [1, c_in, 7, 7], None, inits,
+    )
+
+    result, model = _apply(MoveAddPastConvInput_v1, proto)
+
+    assert result.modified
+    assert [n.op_type for n in model.graph][0] == "Conv"
+    _assert_equivalent(proto, model, [1, c_in, 7, 7])
+
+
+@pytest.mark.parametrize("c,attrs", [
+    (np.full((1, 2, 1, 1), 1.0), {"pads": [1, 1, 1, 1]}),  # Padding
+    (np.full((1, 2, 1, 1), 1.0), {"auto_pad": "SAME_UPPER"}),
+    (np.arange(18.0).reshape(1, 2, 3, 3), {}),              # Spatially varying
+])
+def test_add_past_conv_rejects(c, attrs):
+    proto = _model(
+        [oh.make_node("Add", ["x", "c"], ["xc"]), oh.make_node("Conv", ["xc", "w"], ["y"], **attrs)],
+        [1, 2, 3, 3], None, {"c": c, "w": RNG.choice([-1.0, 1.0], (4, 2, 3, 3))},
+    )
+    assert not _apply(MoveAddPastConvInput_v1, proto)[0].modified

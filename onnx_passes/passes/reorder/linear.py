@@ -372,6 +372,17 @@ class MoveChannelMulPastDepthwiseConvInput_v1(RewriteRule, Verify):
         return y
 
 
+def _vector_along(value: np.ndarray, axis: int) -> np.ndarray | None:
+    """The vector along axis if value only varies along this axis, else None."""
+    # Move the axis last and check all other positions repeat the same vector
+    vectors = np.reshape(np.moveaxis(value, axis, -1), (-1, value.shape[axis]))
+
+    if not np.all(vectors == vectors[0]):
+        return None
+
+    return vectors[0]
+
+
 def _uniform_magnitude_signs(
         value: np.ndarray, axis: int
 ) -> tuple[np.ndarray, np.ndarray] | None:
@@ -381,21 +392,15 @@ def _uniform_magnitude_signs(
     axis, all magnitudes are identical and nonzero and s is not effectively
     scalar (covered by the scalar rules), None otherwise.
     """
-    if _is_scalar(value):
+    if _is_scalar(value) or (vector := _vector_along(value, axis)) is None:
         return None
 
-    # Move the axis last and check all other positions repeat the same vector
-    vectors = np.reshape(np.moveaxis(value, axis, -1), (-1, value.shape[axis]))
-
-    if not np.all(vectors == vectors[0]):
-        return None
-
-    magnitude = np.abs(vectors[0])
+    magnitude = np.abs(vector)
 
     if magnitude[0] == 0 or not np.all(magnitude == magnitude[0]):
         return None
 
-    return np.sign(vectors[0]), magnitude[0]
+    return np.sign(vector), magnitude[0]
 
 
 def _constant_like(value: np.ndarray, like: ir.Value, op) -> ir.Value:
@@ -533,3 +538,87 @@ class MoveSignedChannelMulPastConvInput_v1(RewriteRule, Verify):
             )
 
         return y
+
+
+def _conv_group(node: ir.Node) -> int:
+    group = node.attributes.get("group")
+    return group.as_int() if group is not None else 1
+
+
+def _conv_is_unpadded(node: ir.Node) -> bool:
+    """True if the Conv node does not pad its input (explicitly or auto)."""
+    if (auto_pad := node.attributes.get("auto_pad")) is not None:
+        if auto_pad.as_string() not in {"NOTSET", "VALID"}:
+            return False
+
+    if (pads := node.attributes.get("pads")) is not None:
+        return not any(pads.as_ints())
+
+    return True
+
+
+@tolerance
+class MoveAddPastConvInput_v1(RewriteRule, Verify):
+    """Reorder per-channel addition of the input past unpadded Conv.
+
+    Conv(x + c, w) = Conv(x, w) + Conv(c, w) for constant weights w, where c is
+    constant along all but the channel axis. Without padding, every output
+    element sees a full kernel window of c, so Conv(c, w) reduces to the
+    per-output-channel bias sum_{j, k} w[m, j, k] * c[g * C_in / group + j] for
+    output channel m of group g. An existing bias stays with the Conv.
+    """
+
+    @property
+    def commute(self) -> bool:
+        return True
+
+    @staticmethod
+    def pattern(op, x, c, w):
+        return op.Conv(
+            op.Add(x, c), w, _allow_other_inputs=True, _outputs=["out"]
+        )
+
+    @staticmethod
+    def check(context, x, c, w, out):
+        node = out.producer()
+
+        if not _conv_is_unpadded(node):
+            return False
+
+        if (weights := ir.convenience.get_const_tensor(w)) is None:
+            return False
+
+        if (value := _broadcast_to_operand(c, x)) is None or value.ndim < 3:
+            return False
+
+        shape = weights.numpy().shape
+        group = _conv_group(node)
+
+        if value.shape[1] != group * shape[1] or shape[0] % group != 0:
+            return False
+
+        return _vector_along(value, 1) is not None
+
+    @staticmethod
+    def rewrite(op, x, c, w, out):
+        node = out.producer()
+        weights = ir.convenience.get_const_tensor(w).numpy()
+        vector = _vector_along(_broadcast_to_operand(c, x), 1)
+        group = _conv_group(node)
+
+        # Input channel offsets of each group repeated for each output channel
+        # of the group: (C_out, C_in / group)
+        vector = np.reshape(vector, (group, -1))
+        vector = np.repeat(vector, weights.shape[0] // group, axis=0)
+
+        # Sum over input channels and the kernel window per output channel
+        window = np.reshape(weights, (*weights.shape[:2], -1)).sum(axis=-1)
+        bias = np.sum(
+            window.astype(np.float64) * vector.astype(np.float64), axis=1
+        )
+        bias = np.reshape(bias, (-1, *(1,) * (weights.ndim - 2)))
+
+        return op.Add(
+            op.Conv(x, *node.inputs[1:], **node.attributes),
+            op.Constant(value=ir.tensor(bias.astype(weights.dtype)))
+        )
