@@ -370,3 +370,166 @@ class MoveChannelMulPastDepthwiseConvInput_v1(RewriteRule, Verify):
             )
 
         return y
+
+
+def _uniform_magnitude_signs(
+        value: np.ndarray, axis: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Splits s varying only along axis into signs and a common magnitude.
+
+    Returns (signs along the axis, scalar magnitude) if s only varies along the
+    axis, all magnitudes are identical and nonzero and s is not effectively
+    scalar (covered by the scalar rules), None otherwise.
+    """
+    if _is_scalar(value):
+        return None
+
+    # Move the axis last and check all other positions repeat the same vector
+    vectors = np.reshape(np.moveaxis(value, axis, -1), (-1, value.shape[axis]))
+
+    if not np.all(vectors == vectors[0]):
+        return None
+
+    magnitude = np.abs(vectors[0])
+
+    if magnitude[0] == 0 or not np.all(magnitude == magnitude[0]):
+        return None
+
+    return np.sign(vectors[0]), magnitude[0]
+
+
+def _constant_like(value: np.ndarray, like: ir.Value, op) -> ir.Value:
+    """Constant from value, propagating a constant folding stop of like."""
+    const = op.Constant(value=ir.tensor(np.ascontiguousarray(value)))
+
+    if like.meta.get("constant_stop"):
+        const.meta["constant_stop"] = True
+
+    return const
+
+
+@tolerance
+class MoveSignedChannelMulPastMatMulLhs_v1(RewriteRule, Verify):
+    """Reorder per-channel sign-scale multiplication of the input past MatMul.
+
+    MatMul(s * x, w) = MatMul(x, sign(s) * w) * |s| for constant weights w if s
+    only varies along the reduction axis, i.e., the last axis of x, and all
+    channels share the same magnitude |s|. The signs are folded into the rows of
+    the weights, which keeps integer weights integer, e.g., the per-channel
+    +-(2x - 1) following bipolar MultiThresholds with sign-flipped channels.
+    """
+
+    @property
+    def commute(self) -> bool:
+        return True
+
+    @staticmethod
+    def pattern(op, x, s, w):
+        return op.MatMul(op.Mul(s, x), w)
+
+    @staticmethod
+    def check(context, x, s, w):
+        if (weights := ir.convenience.get_const_tensor(w)) is None:
+            return False
+
+        if weights.numpy().ndim < 2:
+            return False
+
+        if (value := _broadcast_to_operand(s, x)) is None:
+            return False
+
+        return _uniform_magnitude_signs(value, -1) is not None
+
+    @staticmethod
+    def rewrite(op, x, s, w):
+        value = _broadcast_to_operand(s, x)
+        signs, magnitude = _uniform_magnitude_signs(value, -1)  # noqa: checked
+        weights = ir.convenience.get_const_tensor(w).numpy()
+
+        # Signs per row of the weights, i.e., per reduction channel
+        weights = weights * np.reshape(signs, (-1, 1)).astype(weights.dtype)
+
+        return op.Mul(
+            op.MatMul(x, _constant_like(weights, w, op)),
+            op.Constant(value=ir.tensor(np.asarray(magnitude, value.dtype)))
+        )
+
+
+@tolerance
+class MoveSignedChannelMulPastConvInput_v1(RewriteRule, Verify):
+    """Reorder per-channel sign-scale multiplication of the input past Conv.
+
+    Conv(s * x, w) = Conv(x, sign(s) * w) * |s| for constant weights w if s only
+    varies along the channel axis of x and all channels share the same magnitude
+    |s|. The signs are folded into the input channels of the weights (respecting
+    groups), which keeps integer weights integer. Zero padding is invariant to
+    scaling. A bias is split off as an explicit Add.
+    """
+
+    @property
+    def commute(self) -> bool:
+        return True
+
+    @staticmethod
+    def pattern(op, x, s, w):
+        return op.Conv(
+            op.Mul(s, x), w, _allow_other_inputs=True, _outputs=["out"]
+        )
+
+    @staticmethod
+    def check(context, x, s, w, out):
+        node = out.producer()
+
+        if (weights := ir.convenience.get_const_tensor(w)) is None:
+            return False
+
+        if (value := _broadcast_to_operand(s, x)) is None or value.ndim < 3:
+            return False
+
+        group = node.attributes.get("group")
+        group = group.as_int() if group is not None else 1
+
+        shape = weights.numpy().shape
+        channels = value.shape[1]
+
+        # Input channels must split evenly into groups matching the weights
+        if channels != group * shape[1] or shape[0] % group != 0:
+            return False
+
+        if len(node.inputs) > 2 and node.inputs[2]:
+            if _static_shape(node.inputs[2]) is None:
+                return False
+
+        return _uniform_magnitude_signs(value, 1) is not None
+
+    @staticmethod
+    def rewrite(op, x, s, w, out):
+        node = out.producer()
+        value = _broadcast_to_operand(s, x)
+        signs, magnitude = _uniform_magnitude_signs(value, 1)  # noqa: checked
+        weights = ir.convenience.get_const_tensor(w).numpy()
+        rank = weights.ndim
+
+        group = node.attributes.get("group")
+        group = group.as_int() if group is not None else 1
+
+        # Signs of the input channels of each group, repeated for each output
+        # channel of the group: (C_out, C_in / group, 1, ..., 1)
+        signs = np.reshape(signs, (group, -1))
+        signs = np.repeat(signs, weights.shape[0] // group, axis=0)
+        signs = np.reshape(signs, (*signs.shape, *(1,) * (rank - 2)))
+        weights = weights * signs.astype(weights.dtype)
+
+        y = op.Mul(
+            op.Conv(x, _constant_like(weights, w, op), **node.attributes),
+            op.Constant(value=ir.tensor(np.asarray(magnitude, value.dtype)))
+        )
+
+        if len(node.inputs) > 2 and (b := node.inputs[2]):
+            y = op.Add(
+                y, op.Reshape(
+                    b, op.Constant(value_ints=[-1, *(1,) * (rank - 2)])
+                )
+            )
+
+        return y
