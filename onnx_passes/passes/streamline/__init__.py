@@ -3,7 +3,9 @@
 Following the scaled-integer view of the SIRA paper, streamlining is split into
 two phases which can be applied (and measured) separately:
 
-1. ``StreamlineScales_v1``: Inline quantizers and batch normalization and move
+1. ``StreamlineScales_v1``: Legalize the model (legacy custom-op domains,
+   missing opset imports and outdated default opsets, see ``legalize``),
+   inline quantizers and batch normalization and move
    scales and biases into the layer tails so that the linear operators (Conv,
    MatMul, Gemm) operate on plain integers. Layer tails remain chains of
    elementwise Mul/Add, nonlinearities and Round/Clip quantizer cores.
@@ -21,6 +23,7 @@ from onnx_passes.passes.base import Sequential
 from onnx_passes.passes import canonicalize
 from onnx_passes.passes import cleanup
 from onnx_passes.passes import eliminate
+from onnx_passes.passes import legalize
 from onnx_passes.passes import reorder
 from onnx_passes.passes import unbroadcast
 from onnx_passes.passes.inline import quantizer
@@ -36,6 +39,9 @@ class StreamlineScales_v1(Sequential):
     """Phase 1: Move scales and biases into the layer tails."""
 
     passes = [
+        # Exported models might use legacy domains or opsets: Bring these into
+        # a form the following passes can work with (no-op for legal models)
+        legalize,
         canonicalize,
         quantizer,
         batchnorm,

@@ -12,13 +12,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import onnx
-import onnx.version_converter
 import onnx_ir as ir
 import pytest
 from onnx.reference import ReferenceEvaluator
 
 from onnx_passes.ops import link_ops
+from onnx_passes.passes.legalize import normalize_domains, upgrade_opset
 
 try:
     from tests.test_sira import _CUSTOM_OPS
@@ -227,29 +226,20 @@ def generate_samples(
 
 # Custom-op domains used across the zoo; the legacy FINN domain hosts the same
 # Quant operator as the QONNX domain
-_LEGACY_DOMAINS = {"finn.custom_op.general": "qonnx.custom_op.general"}
-
-
 def load_zoo_model(model_path: Path, target_opset: int | None = None) -> ir.Model:
     """Load a zoo model, declaring custom-op domains and optionally upgrading.
 
     Many zoo models omit opset imports for their custom-op domains and use the
     legacy ``finn.custom_op.general`` domain. Both are normalized here. If
-    ``target_opset`` is given, the default domain is upgraded via the ONNX
-    version converter (onnx-passes needs a recent opset, e.g. for
-    ``Constant(value_int=...)`` in its operator functions).
+    ``target_opset`` is given, the default domain is upgraded (onnx-passes needs
+    a recent opset, e.g. for ``Constant(value_int=...)`` in its operator
+    functions). Shares the implementation with the ``legalize`` passes.
     """
-    proto = onnx.load(model_path)
-    for node in proto.graph.node:
-        node.domain = _LEGACY_DOMAINS.get(node.domain, node.domain)
-    declared = {o.domain for o in proto.opset_import}
-    for domain in sorted({n.domain for n in proto.graph.node if n.domain} - declared):
-        proto.opset_import.append(onnx.helper.make_opsetid(domain, 1))
+    model = ir.load(model_path)
+    normalize_domains(model)
     if target_opset is not None:
-        current = next(o.version for o in proto.opset_import if o.domain in ("", "ai.onnx"))
-        if current < target_opset:
-            proto = onnx.version_converter.convert_version(proto, target_opset)
-    return ir.from_proto(proto)
+        upgrade_opset(model, target_opset)
+    return model
 
 
 def reference_session(model: ir.Model) -> ReferenceEvaluator:
