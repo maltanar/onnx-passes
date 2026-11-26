@@ -151,8 +151,38 @@ class InferPoolingStrides_v1(RewriteRuleSetTemplate, Verify):
         )
 
 
+def _lowest(dtype: ir.DataType) -> np.ndarray:
+    """Padding value which never wins a maximum: -inf or the integer minimum."""
+    dtype = dtype.numpy()
+
+    if np.issubdtype(dtype, np.integer):
+        return np.asarray(np.iinfo(dtype).min, dtype=dtype)
+
+    return np.asarray(-np.inf, dtype=dtype)
+
+
+def _pool_output_size(size, k, s, d, begin, end, ceil_mode):
+    """Pooling output size along one axis following ONNX (and onnxruntime).
+
+    In ceil mode, a last window starting within the right padding is dropped.
+    """
+    span = size + begin + end - (d * (k - 1) + 1)
+    out = (-(-span // s) if ceil_mode else span // s) + 1
+
+    if ceil_mode and (out - 1) * s >= size + begin:
+        out -= 1
+
+    return out
+
+
 class RewritePaddedMaxPoolAsPadMaxPool_v1(RewriteRule, Verify):
-    """Rewrite padded MaxPool operation as standalone Pad combination."""
+    """Rewrite padded MaxPool operation as standalone Pad combination.
+
+    MaxPool ignores padded elements, which is equivalent to padding with the
+    lowest value of the data type (-inf for floating-point types). In ceil mode,
+    partial windows at the end are equivalent to extending the end padding to
+    fit the last window.
+    """
 
     @staticmethod
     def pattern(op, x, pads):
@@ -160,33 +190,58 @@ class RewritePaddedMaxPoolAsPadMaxPool_v1(RewriteRule, Verify):
 
     @staticmethod
     def check(context, x, pads, out):
-        return any(pads.as_ints()) and x.shape is not None
+        if not any(pads.as_ints()) or x.shape is None or x.dtype is None:
+            return False
+
+        # Ceil mode requires static spatial sizes to derive the end padding
+        attributes = out.producer().attributes
+
+        if (ceil_mode := attributes.get("ceil_mode")) and ceil_mode.as_int():
+            spatial = len(pads.as_ints()) // 2
+            return all(isinstance(n, int) for n in x.shape[-spatial:])
+
+        return True
 
     @staticmethod
     def rewrite(op, x, pads, out):
         # Collect original attributes and delete padding and ceil_mode which are
         # handled by standalone padding.
         attributes = out.producer().attributes
+        ceil_mode = attributes.pop("ceil_mode", None)
+        ceil_mode = ceil_mode is not None and ceil_mode.as_int()
         del attributes["pads"]
-        del attributes["ceil_mode"]
 
         spatial = len(pads := pads.as_ints()) // 2
+        begin, end = list(pads[:spatial]), list(pads[spatial:])
+
+        # Extend the end padding such that floor mode produces the same windows
+        # as ceil mode, including the partial windows at the end
+        if ceil_mode:
+            kernel = attributes["kernel_shape"].as_ints()
+            strides = attributes["strides"].as_ints() \
+                if "strides" in attributes else spatial * [1]
+            dilations = attributes["dilations"].as_ints() \
+                if "dilations" in attributes else spatial * [1]
+
+            for i, (n, k, s, d) in enumerate(
+                    zip(x.shape[-spatial:], kernel, strides, dilations)
+            ):
+                size = _pool_output_size(n, k, s, d, begin[i], end[i], True)
+                last = (size - 1) * s + d * (k - 1) + 1
+                end[i] = max(end[i], last - n - begin[i])
 
         return op.MaxPool(
             # Explicit padding of the input, filling up pads for non-spatial
-            # dimensions with zero
+            # dimensions with zero, padding with the lowest value of the type
             op.Pad(
                 x,
                 op.Constant(
                     value_ints=[
-                        *((len(x.shape) - spatial) * [0]), *pads[:spatial],
-                        *((len(x.shape) - spatial) * [0]), *pads[spatial:],
+                        *((len(x.shape) - spatial) * [0]), *begin,
+                        *((len(x.shape) - spatial) * [0]), *end,
                     ]
                 ),
-                op.CastLike(
-                    op.Constant(value_float=0.0),
-                    x
-                )
+                op.Constant(value=ir.tensor(_lowest(x.dtype)))
             ),
             **attributes
         )
