@@ -1,0 +1,256 @@
+{
+  "2W2A_rn8_pow2.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 9,
+      "scaled-int": 1,
+      "non-int": 0
+    },
+    "residual_after_p2": 1,
+    "multithresholds_after_p2": 12,
+    "stray_after_p2": {
+      "Mul": 2,
+      "Round": 1,
+      "Floor": 1
+    },
+    "max_abs_err_p1": 0.0,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 0.0,
+    "mismatch_p2": 0.0
+  },
+  "3W3A_rn8_fp.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 9,
+      "scaled-int": 1,
+      "non-int": 0
+    },
+    "residual_after_p2": 1,
+    "multithresholds_after_p2": 11,
+    "stray_after_p2": {
+      "Mul": 2,
+      "Round": 1,
+      "Floor": 1
+    },
+    "max_abs_err_p1": 4.76837158203125e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 4.76837158203125e-07,
+    "mismatch_p2": 0.0
+  },
+  "CNV_1W1A.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 9,
+      "scaled-int": 0,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 9,
+    "stray_after_p2": {
+      "Mul": 2
+    },
+    "max_abs_err_p1": 1.1920928955078125e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 1.1920928955078125e-07,
+    "mismatch_p2": 0.0
+  },
+  "CNV_1W2A.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 9,
+      "scaled-int": 0,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 9,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 1.1920928955078125e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 1.1920928955078125e-07,
+    "mismatch_p2": 0.0
+  },
+  "CNV_2W2A.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 9,
+      "scaled-int": 0,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 9,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 1.7881393432617188e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 2.384185791015625e-07,
+    "mismatch_p2": 0.0
+  },
+  "LFC_1W1A.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 4,
+      "scaled-int": 0,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 4,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 2.384185791015625e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 2.384185791015625e-07,
+    "mismatch_p2": 0.0
+  },
+  "LFC_1W2A.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 4,
+      "scaled-int": 0,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 4,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 4.76837158203125e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 4.76837158203125e-07,
+    "mismatch_p2": 0.0
+  },
+  "TFC_1W1A.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 4,
+      "scaled-int": 0,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 4,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 1.1920928955078125e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 1.1920928955078125e-07,
+    "mismatch_p2": 0.0
+  },
+  "TFC_1W2A.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 4,
+      "scaled-int": 0,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 4,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 1.1920928955078125e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 1.1920928955078125e-07,
+    "mismatch_p2": 0.0
+  },
+  "TFC_2W2A.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 4,
+      "scaled-int": 0,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 4,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 2.384185791015625e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 2.384185791015625e-07,
+    "mismatch_p2": 0.0
+  },
+  "cloudsatnet_qat_4bit_exsi.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 12,
+      "scaled-int": 0,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 12,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 4.76837158203125e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 4.76837158203125e-07,
+    "mismatch_p2": 0.0
+  },
+  "cnv_1w1a_gtsrb.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 9,
+      "scaled-int": 0,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 9,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 4.76837158203125e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 4.76837158203125e-07,
+    "mismatch_p2": 0.0
+  },
+  "kwsmlp_w3a3.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 4,
+      "scaled-int": 0,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 4,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 4.76837158203125e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 4.76837158203125e-07,
+    "mismatch_p2": 0.0
+  },
+  "mobilenet_4W4A.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 27,
+      "scaled-int": 1,
+      "non-int": 0
+    },
+    "residual_after_p2": 1,
+    "multithresholds_after_p2": 27,
+    "stray_after_p2": {
+      "Mul": 3,
+      "Round": 1,
+      "Floor": 1
+    },
+    "max_abs_err_p1": 4.76837158203125e-07,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 4.76837158203125e-07,
+    "mismatch_p2": 0.0
+  },
+  "qkeras_jettagging.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 3,
+      "scaled-int": 0,
+      "non-int": 1
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 3,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 0.0,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 0.0,
+    "mismatch_p2": 0.0
+  },
+  "unsw_nb15-mlp-w2a2.onnx": {
+    "errors": [],
+    "linear_after_p1": {
+      "int": 3,
+      "scaled-int": 1,
+      "non-int": 0
+    },
+    "residual_after_p2": 0,
+    "multithresholds_after_p2": 4,
+    "stray_after_p2": {},
+    "max_abs_err_p1": 0.0,
+    "mismatch_p1": 0.0,
+    "max_abs_err_p2": 0.0,
+    "mismatch_p2": 0.0
+  }
+}

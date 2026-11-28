@@ -142,6 +142,58 @@ def op_histogram(model: ir.Model) -> dict[str, int]:
     return dict(Counter(n.op_type for n in model.graph))
 
 
+# Operators making up the canonical streamlined layer structure: thresholds,
+# integer linear operators, padding and pooling, and pure data movement
+CANONICAL_OPS = LINEAR_OPS | {
+    "MultiThreshold", "Pad", "MaxPool", "AveragePool", "GlobalMaxPool",
+    "GlobalAveragePool", "Reshape", "Flatten", "Transpose", "Squeeze",
+    "Unsqueeze", "Concat", "Split", "Slice", "Gather", "Identity", "Shape",
+    "Constant",
+}
+# Operators allowed in the output tail: the final output scale and bias, data
+# movement and the classification head
+TAIL_OPS = {"Mul", "Add", "Sub", "Div"} | CANONICAL_OPS - LINEAR_OPS - {"MultiThreshold"} | {
+    "Softmax", "LogSoftmax", "ArgMax", "TopK",
+}
+
+
+def stray_ops(model: ir.Model) -> dict[str, int]:
+    """Operators outside the canonical streamlined structure, by type.
+
+    Canonical are MultiThreshold, linear operators, padding, pooling and data
+    movement, residual Adds joining two activations, and the output tail: the
+    operators after the last linear operator or MultiThreshold which only apply
+    constants (the output scale and bias) or move data. Anything else, e.g., an
+    elementwise operation stuck between two layers, counts as stray.
+    """
+    const = _const_derived(model)
+    outputs = set(model.graph.outputs)
+
+    # Output tail, walking backwards: All consumers in the tail, all non-data
+    # inputs constant
+    tail: set[ir.Node] = set()
+    for node in reversed(list(model.graph)):
+        if node.op_type not in TAIL_OPS or node.domain not in {"", "ai.onnx"}:
+            continue
+        data = [v for v in node.inputs if v is not None and v not in const]
+        if node.op_type in {"Mul", "Add", "Sub", "Div"} and len(data) != 1:
+            continue
+        uses = [use.node for out in node.outputs for use in out.uses()]
+        if all(use in tail for use in uses) and (uses or set(node.outputs) & outputs):
+            tail.add(node)
+
+    stray = Counter()
+    for node in model.graph:
+        if node in tail or node.outputs[0] in const:
+            continue
+        if node.op_type in CANONICAL_OPS:
+            continue
+        if node.op_type == "Add" and not any(v in const for v in node.inputs):
+            continue  # Residual join of two activations
+        stray[node.op_type] += 1
+    return dict(stray)
+
+
 # ---------------------------------------------------------------------------
 # Equivalence
 # ---------------------------------------------------------------------------
@@ -179,6 +231,7 @@ class StreamlineReport:
     act_quantizers_before: int | None = None
     residual_after_p2: int | None = None
     multithresholds_after_p2: int | None = None
+    stray_after_p2: dict[str, int] | None = None
     max_abs_err_p1: float | None = None
     mismatch_p1: float | None = None
     max_abs_err_p2: float | None = None
@@ -241,10 +294,91 @@ def run_streamlining_model(model_path: Path, n_samples: int) -> StreamlineReport
     rep.ops_after_p2 = op_histogram(p2)
     rep.residual_after_p2 = residual_quantizers(p2)
     rep.multithresholds_after_p2 = rep.ops_after_p2.get("MultiThreshold", 0)
+    rep.stray_after_p2 = stray_ops(p2)
     if expected is not None and (out := stage("eval_p2", lambda: _run(p2, samples))) is not None:
         rep.max_abs_err_p2, rep.mismatch_p2 = compare_outputs(expected, out)
 
     return rep
+
+
+# ---------------------------------------------------------------------------
+# Baseline ratchet
+# ---------------------------------------------------------------------------
+
+BASELINE_PATH = Path(__file__).with_name("zoo_baseline.json")
+
+# Output errors are float noise near zero: Slack before an increase counts
+ERR_SLACK = 1e-6
+
+
+def baseline_entry(rep: StreamlineReport) -> dict:
+    """The metrics of a report recorded in the baseline."""
+    return {
+        "errors": sorted(rep.errors),
+        "linear_after_p1": rep.linear_after_p1,
+        "residual_after_p2": rep.residual_after_p2,
+        "multithresholds_after_p2": rep.multithresholds_after_p2,
+        "stray_after_p2": rep.stray_after_p2,
+        "max_abs_err_p1": rep.max_abs_err_p1,
+        "mismatch_p1": rep.mismatch_p1,
+        "max_abs_err_p2": rep.max_abs_err_p2,
+        "mismatch_p2": rep.mismatch_p2,
+    }
+
+
+def load_baseline(path: Path = BASELINE_PATH) -> dict[str, dict]:
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+@dataclass
+class Comparison:
+    """Changes of one model's metrics relative to the baseline."""
+    regressions: list[str] = field(default_factory=list)
+    improvements: list[str] = field(default_factory=list)
+    new: bool = False
+
+
+def _total(d: dict[str, int] | None) -> int | None:
+    return None if d is None else sum(d.values())
+
+
+def compare_to_baseline(rep: StreamlineReport, base: dict | None) -> Comparison:
+    """Compare a report against its baseline entry: Each metric may only stay
+    the same or improve. MultiThreshold counts are informational only."""
+    cmp = Comparison()
+    if base is None:
+        cmp.new = True
+        return cmp
+
+    def check(name, now, before, lower_is_better, slack=0.0):
+        if now is None and before is None:
+            return
+        if now is None:
+            cmp.regressions.append(f"{name}: {before} -> missing")
+        elif before is None:
+            cmp.improvements.append(f"{name}: missing -> {now}")
+        elif (now - before > slack) if lower_is_better else (before - now > slack):
+            cmp.regressions.append(f"{name}: {before:g} -> {now:g}")
+        elif (before - now > slack) if lower_is_better else (now - before > slack):
+            cmp.improvements.append(f"{name}: {before:g} -> {now:g}")
+
+    new_errors = sorted(set(rep.errors) - set(base["errors"]))
+    if new_errors:
+        cmp.regressions.append(f"new stage errors: {', '.join(new_errors)}")
+    if fixed := sorted(set(base["errors"]) - set(rep.errors)):
+        cmp.improvements.append(f"fixed stage errors: {', '.join(fixed)}")
+
+    linear, linear_before = rep.linear_after_p1 or {}, base["linear_after_p1"] or {}
+    check("int linear ops", linear.get("int"), linear_before.get("int"), False)
+    check("non-int linear ops", linear.get("non-int"), linear_before.get("non-int"), True)
+    check("residual quantizers", rep.residual_after_p2, base["residual_after_p2"], True)
+    check("stray ops", _total(rep.stray_after_p2), _total(base["stray_after_p2"]), True)
+    for phase in ("p1", "p2"):
+        check(f"max abs err {phase.upper()}", getattr(rep, f"max_abs_err_{phase}"),
+              base[f"max_abs_err_{phase}"], True, ERR_SLACK)
+        check(f"mismatch {phase.upper()}", getattr(rep, f"mismatch_{phase}"),
+              base[f"mismatch_{phase}"], True)
+    return cmp
 
 
 # ---------------------------------------------------------------------------
@@ -271,13 +405,22 @@ def test_modelzoo_streamlining(model_path: Path):
         if frac > 0:
             warnings.warn(f"{model_path.name} {phase}: {frac:.2%} mismatch, max abs err {err:.4g}")
 
-    # 3. No regression of the streamlining metrics
+    # 3. No regression relative to the unstreamlined model
     assert rep.linear_after_p1["int"] >= rep.linear_before["int"], (
         f"Fewer int-only linear ops after phase 1: {rep.linear_before} -> {rep.linear_after_p1}"
     )
     assert rep.residual_after_p2 <= rep.act_quantizers_before, (
         f"More residual quantizers after phase 2: {rep.act_quantizers_before} -> {rep.residual_after_p2}"
     )
+
+    # 4. No regression relative to the recorded baseline (models without an
+    # entry, e.g., local additions to the zoo, are not compared)
+    cmp = compare_to_baseline(rep, load_baseline().get(rep.model))
+    assert not cmp.regressions, f"Regressed against {BASELINE_PATH.name}: {cmp.regressions}"
+    if cmp.improvements:
+        warnings.warn(
+            f"{rep.model} improved, update the baseline: {cmp.improvements}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -292,26 +435,82 @@ def _fmt(x, spec=".3g") -> str:
     return "-" if x is None else format(x, spec)
 
 
-def format_markdown_report(reports: list[StreamlineReport]) -> str:
-    lines = [
-        "# QONNX Model Zoo Streamlining Report",
+def _fmt_stray(stray: dict[str, int] | None) -> str:
+    if stray is None:
+        return "-"
+    if not stray:
+        return "0"
+    ops = ", ".join(
+        f"{op}" if n == 1 else f"{op}×{n}" for op, n in sorted(stray.items())
+    )
+    return f"{sum(stray.values())} ({ops})"
+
+
+def _status(cmp: Comparison) -> str:
+    if cmp.regressions:
+        return "❌ regressed"
+    if cmp.new:
+        return "🆕 new"
+    if cmp.improvements:
+        return "✅ improved"
+    return "✅"
+
+
+def format_markdown_report(
+        reports: list[StreamlineReport], comparisons: list[Comparison] | None = None
+) -> str:
+    comparisons = comparisons or [Comparison(new=True) for _ in reports]
+    regressed = sum(bool(c.regressions) for c in comparisons)
+    improved = sum(bool(c.improvements) and not c.regressions for c in comparisons)
+    new = sum(c.new for c in comparisons)
+
+    lines = ["# QONNX Model Zoo Streamlining Report", ""]
+    if regressed:
+        lines.append(f"**❌ {regressed} of {len(reports)} models regressed** against the baseline.")
+    else:
+        lines.append(f"**✅ No regressions** against the baseline ({len(reports)} models).")
+    if improved:
+        lines.append(
+            f"{improved} improved: update the baseline with `--update-baseline` to lock this in."
+        )
+    if new:
+        lines.append(f"{new} not in the baseline yet.")
+    lines += [
         "",
-        "Linear ops are counted as int/scaled-int/non-int (SIRA). Residual quantizers count"
-        " Quant/BipolarQuant/Trunc/Round/Sign and unabsorbed comparisons left after phase 2.",
-        "",
-        "| Model | Linear before | Linear after P1 | Act. quant before | Residual after P2 | MultiThreshold |"
-        " Max err P1 | Mismatch P1 | Max err P2 | Mismatch P2 | Time P1/P2 (s) | Errors |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| Model | Status | Linear before | Linear after P1 | Act. quant before | Residual after P2 |"
+        " Stray ops after P2 | MultiThreshold | Max err P1 | Mismatch P1 | Max err P2 | Mismatch P2 |"
+        " Time P1/P2 (s) | Errors |",
+        "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---|",
     ]
-    for r in reports:
+    for r, c in zip(reports, comparisons):
         errors = "; ".join(f"{k}: {v}" for k, v in r.errors.items()).replace("|", "\\|")
         lines.append(
-            f"| `{r.model}` | {_fmt_buckets(r.linear_before)} | {_fmt_buckets(r.linear_after_p1)} | "
+            f"| `{r.model}` | {_status(c)} | {_fmt_buckets(r.linear_before)} | "
+            f"{_fmt_buckets(r.linear_after_p1)} | "
             f"{_fmt(r.act_quantizers_before, 'd')} | {_fmt(r.residual_after_p2, 'd')} | "
+            f"{_fmt_stray(r.stray_after_p2)} | "
             f"{_fmt(r.multithresholds_after_p2, 'd')} | {_fmt(r.max_abs_err_p1)} | "
             f"{_fmt(r.mismatch_p1, '.2%')} | {_fmt(r.max_abs_err_p2)} | {_fmt(r.mismatch_p2, '.2%')} | "
             f"{_fmt(r.seconds_p1, '.1f')}/{_fmt(r.seconds_p2, '.1f')} | {errors or '-'} |"
         )
+
+    changes = [(r, c) for r, c in zip(reports, comparisons) if c.regressions or c.improvements]
+    if changes:
+        lines += ["", "## Changes against the baseline", ""]
+        for r, c in changes:
+            for change in c.regressions:
+                lines.append(f"- ❌ `{r.model}`: {change}")
+            for change in c.improvements:
+                lines.append(f"- ✅ `{r.model}`: {change}")
+
+    lines += [
+        "",
+        "Linear ops are counted as int/scaled-int/non-int (SIRA). Residual quantizers count"
+        " Quant/BipolarQuant/Trunc/Round/Sign and unabsorbed comparisons left after phase 2."
+        " Stray ops are operators outside the canonical streamlined structure (MultiThreshold,"
+        " linear ops, padding, pooling, data movement, residual Adds and the output scale/bias),"
+        " e.g., elementwise operations stuck between layers.",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -321,32 +520,49 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--filter", default="", help="Only run models whose file name contains this substring")
     parser.add_argument("--report", type=Path, default=None, help="Optional Markdown report output path")
     parser.add_argument("--json", type=Path, default=None, help="Optional JSON report output path")
+    parser.add_argument("--baseline", type=Path, default=BASELINE_PATH, help="Baseline metrics to compare against")
+    parser.add_argument(
+        "--update-baseline", action="store_true",
+        help="Record the metrics of the models run as the new baseline (other entries are kept)",
+    )
     args = parser.parse_args(argv)
 
     models = [p for p in streamlining_models() if args.filter.lower() in p.name.lower()]
     if not models:
         raise SystemExit("No models: set QONNX_MODEL_ZOO to the QONNX model zoo's models/ directory")
 
-    reports = []
+    baseline = load_baseline(args.baseline)
+    reports, comparisons = [], []
     for p in models:
         n = args.samples or (1 if _is_large(p) else 3)
         rep = run_streamlining_model(p, n)
+        cmp = compare_to_baseline(rep, baseline.get(rep.model))
         reports.append(rep)
+        comparisons.append(cmp)
         print(
             f"{rep.model:36s} linear {_fmt_buckets(rep.linear_before)} -> {_fmt_buckets(rep.linear_after_p1)}"
             f"  quant {rep.act_quantizers_before} -> {_fmt(rep.residual_after_p2, 'd')}"
+            f"  stray {_fmt_stray(rep.stray_after_p2)}"
             f"  err {_fmt(rep.max_abs_err_p1)}/{_fmt(rep.max_abs_err_p2)}"
-            f"  {rep.errors or ''}",
+            f"  {_status(cmp)} {cmp.regressions or ''} {rep.errors or ''}",
             flush=True,
         )
 
-    md = format_markdown_report(reports)
+    md = format_markdown_report(reports, comparisons)
     print(md)
     if args.report:
         args.report.write_text(md)
     if args.json:
         args.json.write_text(json.dumps([asdict(r) for r in reports], indent=2))
-    return 0
+
+    if args.update_baseline:
+        baseline.update({r.model: baseline_entry(r) for r in reports})
+        args.baseline.write_text(json.dumps(dict(sorted(baseline.items())), indent=2) + "\n")
+        print(f"Updated {args.baseline} ({len(reports)} models)")
+        return 0
+
+    # Fail on regressions and on stage errors (also of models without baseline)
+    return 1 if any(c.regressions for c in comparisons) or any(r.errors for r in reports) else 0
 
 
 if __name__ == "__main__":

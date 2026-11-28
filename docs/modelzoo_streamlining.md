@@ -38,6 +38,14 @@ oracle; it does not drive any transformation. Input domains come from
 - **Phase 2:** number of activation `Quant`/`BipolarQuant` nodes in the original
   model vs. residual quantizer cores (`Round` + `Sign`) remaining after phase 2.
   Success is zero residual.
+- **Stray ops after phase 2:** operators outside the canonical streamlined
+  structure, by type. Canonical are `MultiThreshold`, linear operators, `Pad`,
+  pooling, data movement (`Reshape`, `Transpose`, ...), residual `Add`s joining
+  two activations, and the output tail (the final output scale and bias, data
+  movement and the classification head). Anything else, e.g., a per-channel
+  `Mul` or `Add` stuck between two layers, is stray. Success is zero stray ops.
+  This catches what the quantizer counts miss: the stuck `Add` and channel
+  masks in 2W2A_rn8_pow2 changed none of the other metrics.
 
 Accumulator bitwidth is out of scope.
 
@@ -48,8 +56,48 @@ Accumulator bitwidth is out of scope.
    QONNX ops) on samples from `generate_samples`, `atol=1e-3`. Up to 1% of
    output elements may mismatch (float reordering can flip a `Round` near a .5
    tie); that is reported as a warning, not a failure.
-3. No regression: `int` count after phase 1 >= before; residual quantizers
-   after phase 2 <= before.
+3. No regression against the unstreamlined model: `int` count after phase 1
+   >= before; residual quantizers after phase 2 <= before.
+4. No regression against the baseline (`tests/zoo_baseline.json`), see below.
+
+## Baseline ratchet
+
+`tests/zoo_baseline.json` records the metrics of every model at the pinned
+zoo commit. A run fails if any model gets worse than its entry:
+
+- new stage errors,
+- fewer `int` or more `non-int` linear ops after phase 1,
+- more residual quantizers or stray ops after phase 2,
+- a higher max abs error (beyond 1e-6 of float noise) or mismatch fraction.
+
+`MultiThreshold` counts and timings are reported but not compared. Models
+without an entry are reported as new and not compared.
+
+When a change improves a model, the report says so. Lock the improvement in by
+updating the baseline in the same commit, so the review diff shows what
+improved:
+
+```text
+QONNX_MODEL_ZOO=<clean zoo checkout at the pinned commit>/models \
+    python tests/test_modelzoo_streamlining.py --update-baseline
+```
+
+Use a clean checkout (`git clone` of the zoo at the commit named in
+`.github/workflows/tests.yml`): stray local files in the zoo directory would
+end up in the baseline otherwise. `--filter` updates only the matching
+entries.
+
+## CI
+
+`.github/workflows/tests.yml` runs on every push and pull request:
+
+- **Unit tests:** `pytest`, zoo tests skip without `QONNX_MODEL_ZOO`.
+- **Model zoo streamlining:** checks out the zoo at `QONNX_MODEL_ZOO_REF` and
+  runs the campaign against the baseline. The Markdown report appears on the
+  run's summary page and is uploaded as the `zoo-streamlining-report`
+  artifact (Markdown and JSON). Then runs the SIRA zoo tests.
+
+The zoo commit and the baseline belong together: update both at once.
 
 ## Model scope
 
@@ -65,7 +113,8 @@ Accumulator bitwidth is out of scope.
   ReferenceEvaluator setup), used by `tests/test_sira_zoo.py` and
   `tests/test_modelzoo_streamlining.py`.
 - `tests/test_modelzoo_streamlining.py`: one parametrized pytest per model plus
-  a `main()` that prints a markdown report, mirroring `test_sira_zoo.py`.
+  a `main()` that prints a markdown report, mirroring `test_sira_zoo.py`. The
+  standalone run exits nonzero on regressions or stage errors.
 - Set `QONNX_MODEL_ZOO` to the zoo's `models/` directory.
 
 ## Results

@@ -1,0 +1,83 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Newer pushes to the same branch supersede running checks
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # QONNX model zoo commit the baseline (tests/zoo_baseline.json) refers to:
+  # Update both together
+  QONNX_MODEL_ZOO_REF: 704721e483e460d1cd99af0e18781718d9ca84f0
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Dynamic versioning derives the version from the git history
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install
+        run: pip install -e ".[test]"
+      # Zoo tests skip without QONNX_MODEL_ZOO, they run in the zoo job
+      - name: Test
+        run: pytest -q
+
+  zoo:
+    name: Model zoo streamlining
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: fastmachinelearning/qonnx_model_zoo
+          ref: ${{ env.QONNX_MODEL_ZOO_REF }}
+          path: qonnx_model_zoo
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install
+        run: pip install -e ".[test]"
+      - name: Streamlining campaign
+        env:
+          QONNX_MODEL_ZOO: ${{ github.workspace }}/qonnx_model_zoo/models
+        run: >
+          python tests/test_modelzoo_streamlining.py
+          --report zoo_report.md --json zoo_report.json
+      # Report on the run's summary page, also if the campaign regressed
+      - name: Report
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f zoo_report.md ]; then
+            cat zoo_report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Streamlining campaign did not produce a report" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: zoo-streamlining-report
+          path: |
+            zoo_report.md
+            zoo_report.json
+          if-no-files-found: warn
+      - name: SIRA zoo tests
+        if: ${{ !cancelled() }}
+        env:
+          QONNX_MODEL_ZOO: ${{ github.workspace }}/qonnx_model_zoo/models
+        run: pytest -q tests/test_sira_zoo.py
